@@ -1,22 +1,35 @@
 """
-FIFO job queue for subscription-testing requests. A small, fixed number of
-workers (JOB_CONCURRENCY) process jobs sequentially so the host isn't asked
-to run an unbounded number of sing-box processes at once. Inside a job,
-individual configs are still tested concurrently, capped by
-TEST_CONCURRENCY.
+FIFO-очередь для задач тестирования подписок. Фиксированное число воркеров
+(JOB_CONCURRENCY) обрабатывают задачи последовательно, чтобы не плодить бесконечно
+sing-box процессы. Внутри задачи конфиги тестируются конкурентно (TEST_CONCURRENCY).
+
+WorkingItem хранит latency_ms и speed_mbps, чтобы main.py мог выводить
+отсортированный по скорости/пингу список в кнопках выбора.
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
-from typing import Awaitable, Callable, List, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 import config as cfg
-from protocol_parser import ParsedConfig, extract_flag_emoji, build_final_link
-from singbox_runner import test_config
+import sni_whitelist
+from protocol_parser import ParsedConfig, build_final_link, extract_flag_emoji
+from singbox_runner import TestResult, test_config
 
 ProgressCb = Callable[[str], Awaitable[None]]
-DoneCb = Callable[[List[str], int, int], Awaitable[None]]
+
+
+@dataclasses.dataclass
+class WorkingItem:
+    line: str
+    is_fast: bool
+    is_white: bool
+    latency_ms: Optional[float] = None
+    speed_mbps: Optional[float] = None
+
+
+DoneCb = Callable[[List[WorkingItem], int, int], Awaitable[None]]
 
 
 @dataclasses.dataclass
@@ -85,7 +98,7 @@ class JobQueue:
 
     async def _run_job(self, job: Job):
         total = len(job.configs)
-        working: List[Tuple[ParsedConfig, float]] = []
+        working: List[Tuple[ParsedConfig, TestResult]] = []
         checked = 0
         sem = asyncio.Semaphore(cfg.TEST_CONCURRENCY)
         lock = asyncio.Lock()
@@ -97,26 +110,52 @@ class JobQueue:
             async with sem:
                 if job.cancelled:
                     return
-                ok, latency = await test_config(pc.outbound)
+                result = await test_config(pc.outbound)
             async with lock:
                 checked += 1
-                if ok:
-                    working.append((pc, latency or 0.0))
+                if result.ok:
+                    working.append((pc, result))
                 if checked % 10 == 0 or checked == total:
-                    await job.progress_cb(f"Проверено {checked}/{total}, рабочих: {len(working)}")
+                    await job.progress_cb(
+                        f"Проверено {checked}/{total}, рабочих: {len(working)}"
+                    )
 
         await asyncio.gather(*(worker(pc) for pc in job.configs))
 
         if job.cancelled:
             return
 
-        working.sort(key=lambda t: t[1])
-        lines = []
-        for idx, (pc, _latency) in enumerate(working, start=1):
+        # Сортировка: сначала по скорости (убывает), при равенстве — по пингу (растёт)
+        def sort_key(t: Tuple[ParsedConfig, TestResult]):
+            _, r = t
+            speed = -(r.speed_mbps or 0.0)          # больше — лучше → инвертируем
+            latency = r.latency_ms if r.latency_ms is not None else float("inf")
+            return (speed, latency)
+
+        working.sort(key=sort_key)
+
+        items: List[WorkingItem] = []
+        for idx, (pc, result) in enumerate(working, start=1):
+            is_fast = (
+                (result.speed_mbps is not None and result.speed_mbps >= cfg.MIN_FAST_SPEED_MBPS)
+                or (result.latency_ms is not None and result.latency_ms <= cfg.MAX_FAST_PING_MS)
+            )
+            sni = pc.outbound.get("tls", {}).get("server_name")
+            is_white = sni_whitelist.is_whitelisted(sni)
+
+            prefix = ("⚡️" if is_fast else "") + ("⚪️" if is_white else "")
             flag = extract_flag_emoji(pc.remark)
             sig = job.signature.strip() if job.signature else ""
-            parts = [p for p in (flag, sig) if p]
+            parts = [p for p in (prefix, flag, sig) if p]
             new_remark = " ".join(parts) if parts else f"config-{idx}"
-            lines.append(build_final_link(pc.raw, pc.protocol, new_remark))
 
-        await job.done_cb(lines, len(working), total)
+            line = build_final_link(pc.raw, pc.protocol, new_remark)
+            items.append(WorkingItem(
+                line=line,
+                is_fast=is_fast,
+                is_white=is_white,
+                latency_ms=result.latency_ms,
+                speed_mbps=result.speed_mbps,
+            ))
+
+        await job.done_cb(items, len(items), total)

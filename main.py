@@ -1,8 +1,7 @@
 """
-Telegram bot: users submit a VPN subscription, configs are pulled out,
-tested for real connectivity through sing-box, and the working ones are
-sent back as a clean plain-text file - one link per line, flag emoji kept
-and moved first, followed by the user's own signature.
+Telegram-бот: пользователь присылает подписку или список конфигов,
+бот проверяет их через sing-box, сортирует по скорости/пингу,
+добавляет ⚡️⚪️ префиксы и даёт выбрать, что прислать .txt файлом.
 """
 from __future__ import annotations
 
@@ -11,6 +10,7 @@ import base64
 import binascii
 import logging
 import os
+import uuid
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -18,11 +18,18 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 import config as cfg
+import sni_whitelist
 from protocol_parser import ParseError, parse_config
-from queue_manager import JobQueue
+from queue_manager import JobQueue, WorkingItem
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vpn_tester_bot")
@@ -30,7 +37,49 @@ log = logging.getLogger("vpn_tester_bot")
 router = Router()
 job_queue = JobQueue()
 
+# result_id -> список WorkingItem, хранятся пока кнопки живые
+_pending_results: dict[str, list[WorkingItem]] = {}
+
 URI_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
+
+# ── Фильтры для кнопок доставки ────────────────────────────────────────────
+_DELIVERY_FILTERS = {
+    "all":       lambda i: True,
+    "fast":      lambda i: i.is_fast,
+    "white":     lambda i: i.is_white,
+    "fastwhite": lambda i: i.is_fast and i.is_white,
+}
+_DELIVERY_LABELS = {
+    "all":       "Все",
+    "fast":      "⚡️ Быстрые",
+    "white":     "⚪️ Белые SNI",
+    "fastwhite": "⚡️⚪️ Быстрые и белые",
+}
+
+# Сортировка для каждого фильтра: "speed" — по убыванию скорости,
+# "latency" — по возрастанию пинга
+_SORT_KEYS = {
+    "all":       "speed",
+    "fast":      "speed",
+    "white":     "latency",
+    "fastwhite": "speed",
+}
+
+
+def _sorted_items(items: list[WorkingItem], kind: str) -> list[WorkingItem]:
+    """Возвращает отфильтрованный и отсортированный список."""
+    predicate = _DELIVERY_FILTERS.get(kind, _DELIVERY_FILTERS["all"])
+    selected = [i for i in items if predicate(i)]
+    sort_by = _SORT_KEYS.get(kind, "speed")
+    if sort_by == "speed":
+        selected.sort(
+            key=lambda i: -(i.speed_mbps or 0.0)
+        )
+    else:
+        selected.sort(
+            key=lambda i: i.latency_ms if i.latency_ms is not None else float("inf")
+        )
+    return selected
 
 
 class Flow(StatesGroup):
@@ -77,15 +126,21 @@ async def _get_input_text(message: Message) -> str | None:
     return None
 
 
+# ── Команды ────────────────────────────────────────────────────────────────
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "Привет! Пришли ссылку на подписку (или .txt файл / список конфигов), "
         f"я вытащу конфиги (до {cfg.MAX_CONFIGS} шт.), проверю их через sing-box "
-        "и пришлю рабочие одним файлом.\n\n"
+        "и дам выбрать, какие прислать файлом.\n\n"
+        "Значки у рабочих конфигов:\n"
+        "⚡️ — скорость ≥ 10 Мбит/с или пинг ≤ 80 мс\n"
+        "⚪️ — SNI из российского белого списка (обход DPI)\n\n"
+        "После проверки конфиги отсортированы по скорости/пингу.\n\n"
         "Команды:\n"
-        "/queue — статус очереди\n"
+        "/queue — параметры очереди\n"
         "/cancel — отменить текущий запрос"
     )
 
@@ -101,7 +156,9 @@ async def cmd_queue(message: Message):
     await message.answer(
         f"Параллельно проверяется конфигов в одной подписке: {cfg.TEST_CONCURRENCY}\n"
         f"Одновременно обрабатывается подписок: {cfg.JOB_CONCURRENCY}\n"
-        f"Лимит конфигов на подписку: {cfg.MAX_CONFIGS}"
+        f"Лимит конфигов на подписку: {cfg.MAX_CONFIGS}\n\n"
+        f"⚡️ ставится при скорости от {cfg.MIN_FAST_SPEED_MBPS:g} Мбит/с "
+        f"или пинге до {cfg.MAX_FAST_PING_MS:g} мс"
     )
 
 
@@ -164,7 +221,7 @@ async def receive_subscription(message: Message, state: FSMContext):
     await status.edit_text(
         f"Нашёл {len(parsed)} конфигов.{note}{trunc_note}\n\n"
         "Хочешь добавить свою подпись к рабочим конфигам? Пришли текст подписи "
-        "или отправь /skip, чтобы оставить только флаг (если он есть у конфига)."
+        "или отправь /skip, чтобы оставить только флаг (если есть)."
     )
 
 
@@ -185,19 +242,67 @@ async def _enqueue(message: Message, state: FSMContext, signature: str):
         except Exception:
             pass
 
-    async def done_cb(lines: list[str], working: int, total: int):
-        if not lines:
+    async def done_cb(items: list[WorkingItem], working: int, total: int):
+        if not items:
             await progress_cb(f"Готово. Рабочих конфигов: 0 из {total}.")
             return
-        content = "\n".join(lines).encode("utf-8")
-        doc = BufferedInputFile(content, filename="working_configs.txt")
-        await message.bot.send_document(
-            chat_id, doc, caption=f"Готово: {working} рабочих из {total} проверенных."
-        )
+
+        result_id = uuid.uuid4().hex[:10]
+        _pending_results[result_id] = items
+
+        # Подсчёт и подбор подписей к кнопкам
+        fast_items   = [i for i in items if i.is_fast]
+        white_items  = [i for i in items if i.is_white]
+        fw_items     = [i for i in items if i.is_fast and i.is_white]
+
+        def avg_speed(lst):
+            speeds = [i.speed_mbps for i in lst if i.speed_mbps is not None]
+            return sum(speeds) / len(speeds) if speeds else None
+
+        def avg_ping(lst):
+            pings = [i.latency_ms for i in lst if i.latency_ms is not None]
+            return sum(pings) / len(pings) if pings else None
+
+        def btn_label(key: str, lst: list[WorkingItem]) -> str:
+            base = f"{_DELIVERY_LABELS[key]} ({len(lst)})"
+            if key in ("fast", "fastwhite") and lst:
+                spd = avg_speed(lst)
+                if spd:
+                    base += f" ~{spd:.0f} Мбит/с"
+            elif key == "white" and lst:
+                ping = avg_ping(lst)
+                if ping:
+                    base += f" ~{ping:.0f} мс"
+            return base
+
+        counts_map = {
+            "all":       (working, items),
+            "fast":      (len(fast_items), fast_items),
+            "white":     (len(white_items), white_items),
+            "fastwhite": (len(fw_items), fw_items),
+        }
+
+        buttons = [
+            [InlineKeyboardButton(
+                text=btn_label(key, lst),
+                callback_data=f"send:{result_id}:{key}",
+            )]
+            for key, (count, lst) in counts_map.items()
+            if count > 0
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
         try:
-            await message.bot.delete_message(chat_id, status.message_id)
+            await message.bot.edit_message_text(
+                f"Готово: {working} рабочих из {total}. Что прислать файлом?\n"
+                f"(отсортировано по скорости/пингу)",
+                chat_id=chat_id, message_id=status.message_id, reply_markup=kb,
+            )
         except Exception:
-            pass
+            await message.bot.send_message(
+                chat_id,
+                f"Готово: {working} рабочих из {total}. Что прислать файлом?",
+                reply_markup=kb,
+            )
 
     job = await job_queue.submit(message.from_user.id, parsed, signature, progress_cb, done_cb)
     pos = job_queue.position_of(job.job_id)
@@ -207,14 +312,44 @@ async def _enqueue(message: Message, state: FSMContext, signature: str):
         await progress_cb(f"Начинаю проверку {len(parsed)} конфигов…")
 
 
+@router.callback_query(F.data.startswith("send:"))
+async def send_selected(callback: CallbackQuery):
+    _, result_id, kind = callback.data.split(":", 2)
+    items = _pending_results.get(result_id)
+    if items is None:
+        await callback.answer("Результат устарел, пришли подписку заново.", show_alert=True)
+        return
+
+    selected = _sorted_items(items, kind)
+    if not selected:
+        await callback.answer("Нет конфигов под этот фильтр.", show_alert=True)
+        return
+
+    content = "\n".join(i.line for i in selected).encode("utf-8")
+    doc = BufferedInputFile(content, filename="working_configs.txt")
+    await callback.message.answer_document(
+        doc,
+        caption=(
+            f"{_DELIVERY_LABELS.get(kind, 'Все')}: {len(selected)} конфигов.\n"
+            f"Отсортировано по {'скорости' if _SORT_KEYS.get(kind) == 'speed' else 'пингу'}."
+        ),
+    )
+    await callback.answer()
+
+
 async def main():
     os.makedirs(cfg.WORK_DIR, exist_ok=True)
     if not cfg.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
+
     bot = Bot(token=cfg.BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     job_queue.start()
+
+    # Обновляем SNI-вайтлист с GitHub перед стартом поллинга
+    await sni_whitelist.update_from_github()
+
     await dp.start_polling(bot)
 
 
