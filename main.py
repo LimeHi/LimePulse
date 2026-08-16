@@ -2,6 +2,20 @@
 Telegram-бот: пользователь присылает подписку или список конфигов,
 бот проверяет их через sing-box, сортирует по скорости/пингу,
 добавляет ⚡️⚪️ префиксы и даёт выбрать, что прислать .txt файлом.
+
+Структура кнопок после проверки:
+  [📂 Категории]          ← открывает разбивку белые/чёрные
+  [⚡️ Быстрые (N)]
+  [Все рабочие (N)]
+
+При нажатии «Категории» сообщение заменяется на два блока:
+  ── ⚪️ Белые SNI ──
+  [⚡️⚪️ Быстрые белые (N)]
+  [⚪️ Все белые (N)]
+  ── 🖤 Обычные серверы ──
+  [⚡️ Быстрые чёрные (N)]
+  [🖤 Все чёрные (N)]
+  [← Назад]
 """
 from __future__ import annotations
 
@@ -37,50 +51,147 @@ log = logging.getLogger("vpn_tester_bot")
 router = Router()
 job_queue = JobQueue()
 
-# result_id -> список WorkingItem, хранятся пока кнопки живые
+# result_id -> список WorkingItem
 _pending_results: dict[str, list[WorkingItem]] = {}
 
 URI_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
 
-# ── Фильтры для кнопок доставки ────────────────────────────────────────────
+# ── Фильтры ────────────────────────────────────────────────────────────────
 _DELIVERY_FILTERS = {
-    "all":       lambda i: True,
-    "fast":      lambda i: i.is_fast,
-    "white":     lambda i: i.is_white,
-    "fastwhite": lambda i: i.is_fast and i.is_white,
+    "all":        lambda i: True,
+    "fast":       lambda i: i.is_fast,
+    "white":      lambda i: i.is_white,
+    "fastwhite":  lambda i: i.is_fast and i.is_white,
+    "black":      lambda i: not i.is_white,
+    "fastblack":  lambda i: i.is_fast and not i.is_white,
 }
 _DELIVERY_LABELS = {
-    "all":       "Все",
-    "fast":      "⚡️ Быстрые",
-    "white":     "⚪️ Белые SNI",
-    "fastwhite": "⚡️⚪️ Быстрые и белые",
+    "all":        "Все рабочие",
+    "fast":       "⚡️ Быстрые",
+    "white":      "⚪️ Все белые",
+    "fastwhite":  "⚡️⚪️ Быстрые белые",
+    "black":      "🖤 Все обычные",
+    "fastblack":  "⚡️🖤 Быстрые обычные",
 }
-
-# Сортировка для каждого фильтра: "speed" — по убыванию скорости,
-# "latency" — по возрастанию пинга
 _SORT_KEYS = {
-    "all":       "speed",
-    "fast":      "speed",
-    "white":     "latency",
-    "fastwhite": "speed",
+    "all":        "speed",
+    "fast":       "speed",
+    "white":      "latency",
+    "fastwhite":  "speed",
+    "black":      "speed",
+    "fastblack":  "speed",
 }
 
 
 def _sorted_items(items: list[WorkingItem], kind: str) -> list[WorkingItem]:
-    """Возвращает отфильтрованный и отсортированный список."""
     predicate = _DELIVERY_FILTERS.get(kind, _DELIVERY_FILTERS["all"])
     selected = [i for i in items if predicate(i)]
-    sort_by = _SORT_KEYS.get(kind, "speed")
-    if sort_by == "speed":
-        selected.sort(
-            key=lambda i: -(i.speed_mbps or 0.0)
-        )
+    if _SORT_KEYS.get(kind) == "speed":
+        selected.sort(key=lambda i: -(i.speed_mbps or 0.0))
     else:
-        selected.sort(
-            key=lambda i: i.latency_ms if i.latency_ms is not None else float("inf")
-        )
+        selected.sort(key=lambda i: i.latency_ms if i.latency_ms is not None else float("inf"))
     return selected
 
+
+def _avg_speed(lst: list[WorkingItem]) -> float | None:
+    speeds = [i.speed_mbps for i in lst if i.speed_mbps is not None]
+    return sum(speeds) / len(speeds) if speeds else None
+
+
+def _avg_ping(lst: list[WorkingItem]) -> float | None:
+    pings = [i.latency_ms for i in lst if i.latency_ms is not None]
+    return sum(pings) / len(pings) if pings else None
+
+
+def _btn(text: str, result_id: str, kind: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=f"send:{result_id}:{kind}")
+
+
+# ── Клавиатуры ─────────────────────────────────────────────────────────────
+
+def _main_keyboard(result_id: str, items: list[WorkingItem]) -> InlineKeyboardMarkup:
+    """Главное меню: Категории / Быстрые / Все."""
+    fast = [i for i in items if i.is_fast]
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Кнопка «Категории» — всегда первая
+    rows.append([InlineKeyboardButton(
+        text="📂 Категории",
+        callback_data=f"cat:{result_id}",
+    )])
+
+    # Быстрые (если есть)
+    if fast:
+        spd = _avg_speed(fast)
+        label = f"⚡️ Быстрые ({len(fast)})"
+        if spd:
+            label += f" ~{spd:.0f} Мбит/с"
+        rows.append([_btn(label, result_id, "fast")])
+
+    # Все рабочие
+    rows.append([_btn(f"Все рабочие ({len(items)})", result_id, "all")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _category_keyboard(result_id: str, items: list[WorkingItem]) -> tuple[str, InlineKeyboardMarkup]:
+    """Меню категорий: белые сверху, чёрные снизу."""
+    white     = [i for i in items if i.is_white]
+    fastwhite = [i for i in items if i.is_fast and i.is_white]
+    black     = [i for i in items if not i.is_white]
+    fastblack = [i for i in items if i.is_fast and not i.is_white]
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # ── Белые SNI ──
+    if white:
+        if fastwhite:
+            spd = _avg_speed(fastwhite)
+            label = f"⚡️⚪️ Быстрые белые ({len(fastwhite)})"
+            if spd:
+                label += f" ~{spd:.0f} Мбит/с"
+            rows.append([_btn(label, result_id, "fastwhite")])
+
+        ping = _avg_ping(white)
+        label = f"⚪️ Все белые ({len(white)})"
+        if ping:
+            label += f" ~{ping:.0f} мс"
+        rows.append([_btn(label, result_id, "white")])
+
+    # ── Обычные (чёрные) ──
+    if black:
+        if fastblack:
+            spd = _avg_speed(fastblack)
+            label = f"⚡️🖤 Быстрые обычные ({len(fastblack)})"
+            if spd:
+                label += f" ~{spd:.0f} Мбит/с"
+            rows.append([_btn(label, result_id, "fastblack")])
+
+        spd = _avg_speed(black)
+        label = f"🖤 Все обычные ({len(black)})"
+        if spd:
+            label += f" ~{spd:.0f} Мбит/с"
+        rows.append([_btn(label, result_id, "black")])
+
+    # Назад
+    rows.append([InlineKeyboardButton(
+        text="← Назад",
+        callback_data=f"back:{result_id}",
+    )])
+
+    # Текст-заголовок над клавиатурой
+    parts = []
+    if white:
+        parts.append(f"⚪️ Белые SNI: {len(white)} конфигов")
+    if black:
+        parts.append(f"🖤 Обычные серверы: {len(black)} конфигов")
+    header = "\n".join(parts) + "\n\nВыбери категорию для скачивания:"
+
+    return header, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ── FSM ────────────────────────────────────────────────────────────────────
 
 class Flow(StatesGroup):
     waiting_signature = State()
@@ -137,8 +248,8 @@ async def cmd_start(message: Message, state: FSMContext):
         "и дам выбрать, какие прислать файлом.\n\n"
         "Значки у рабочих конфигов:\n"
         "⚡️ — скорость ≥ 10 Мбит/с или пинг ≤ 80 мс\n"
-        "⚪️ — SNI из российского белого списка (обход DPI)\n\n"
-        "После проверки конфиги отсортированы по скорости/пингу.\n\n"
+        "⚪️ — SNI из российского белого списка (труднее для DPI)\n"
+        "🖤 — обычный SNI (иностранный домен)\n\n"
         "Команды:\n"
         "/queue — параметры очереди\n"
         "/cancel — отменить текущий запрос"
@@ -250,59 +361,21 @@ async def _enqueue(message: Message, state: FSMContext, signature: str):
         result_id = uuid.uuid4().hex[:10]
         _pending_results[result_id] = items
 
-        # Подсчёт и подбор подписей к кнопкам
-        fast_items   = [i for i in items if i.is_fast]
-        white_items  = [i for i in items if i.is_white]
-        fw_items     = [i for i in items if i.is_fast and i.is_white]
+        white_count = sum(1 for i in items if i.is_white)
+        black_count = working - white_count
 
-        def avg_speed(lst):
-            speeds = [i.speed_mbps for i in lst if i.speed_mbps is not None]
-            return sum(speeds) / len(speeds) if speeds else None
-
-        def avg_ping(lst):
-            pings = [i.latency_ms for i in lst if i.latency_ms is not None]
-            return sum(pings) / len(pings) if pings else None
-
-        def btn_label(key: str, lst: list[WorkingItem]) -> str:
-            base = f"{_DELIVERY_LABELS[key]} ({len(lst)})"
-            if key in ("fast", "fastwhite") and lst:
-                spd = avg_speed(lst)
-                if spd:
-                    base += f" ~{spd:.0f} Мбит/с"
-            elif key == "white" and lst:
-                ping = avg_ping(lst)
-                if ping:
-                    base += f" ~{ping:.0f} мс"
-            return base
-
-        counts_map = {
-            "all":       (working, items),
-            "fast":      (len(fast_items), fast_items),
-            "white":     (len(white_items), white_items),
-            "fastwhite": (len(fw_items), fw_items),
-        }
-
-        buttons = [
-            [InlineKeyboardButton(
-                text=btn_label(key, lst),
-                callback_data=f"send:{result_id}:{key}",
-            )]
-            for key, (count, lst) in counts_map.items()
-            if count > 0
-        ]
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        summary = (
+            f"Готово: {working} рабочих из {total}.\n"
+            f"⚪️ Белые SNI: {white_count}  🖤 Обычные: {black_count}\n\n"
+            "Что прислать файлом?"
+        )
+        kb = _main_keyboard(result_id, items)
         try:
             await message.bot.edit_message_text(
-                f"Готово: {working} рабочих из {total}. Что прислать файлом?\n"
-                f"(отсортировано по скорости/пингу)",
-                chat_id=chat_id, message_id=status.message_id, reply_markup=kb,
+                summary, chat_id=chat_id, message_id=status.message_id, reply_markup=kb,
             )
         except Exception:
-            await message.bot.send_message(
-                chat_id,
-                f"Готово: {working} рабочих из {total}. Что прислать файлом?",
-                reply_markup=kb,
-            )
+            await message.bot.send_message(chat_id, summary, reply_markup=kb)
 
     job = await job_queue.submit(message.from_user.id, parsed, signature, progress_cb, done_cb)
     pos = job_queue.position_of(job.job_id)
@@ -311,6 +384,53 @@ async def _enqueue(message: Message, state: FSMContext, signature: str):
     else:
         await progress_cb(f"Начинаю проверку {len(parsed)} конфигов…")
 
+
+# ── Callback: открыть меню категорий ───────────────────────────────────────
+
+@router.callback_query(F.data.startswith("cat:"))
+async def open_categories(callback: CallbackQuery):
+    _, result_id = callback.data.split(":", 1)
+    items = _pending_results.get(result_id)
+    if items is None:
+        await callback.answer("Результат устарел, пришли подписку заново.", show_alert=True)
+        return
+
+    header, kb = _category_keyboard(result_id, items)
+    try:
+        await callback.message.edit_text(header, reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+# ── Callback: вернуться в главное меню ─────────────────────────────────────
+
+@router.callback_query(F.data.startswith("back:"))
+async def back_to_main(callback: CallbackQuery):
+    _, result_id = callback.data.split(":", 1)
+    items = _pending_results.get(result_id)
+    if items is None:
+        await callback.answer("Результат устарел, пришли подписку заново.", show_alert=True)
+        return
+
+    working = len(items)
+    white_count = sum(1 for i in items if i.is_white)
+    black_count = working - white_count
+
+    summary = (
+        f"Готово: {working} рабочих.\n"
+        f"⚪️ Белые SNI: {white_count}  🖤 Обычные: {black_count}\n\n"
+        "Что прислать файлом?"
+    )
+    kb = _main_keyboard(result_id, items)
+    try:
+        await callback.message.edit_text(summary, reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+# ── Callback: скачать файл ─────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("send:"))
 async def send_selected(callback: CallbackQuery):
@@ -325,17 +445,20 @@ async def send_selected(callback: CallbackQuery):
         await callback.answer("Нет конфигов под этот фильтр.", show_alert=True)
         return
 
+    sort_word = "скорости" if _SORT_KEYS.get(kind) == "speed" else "пингу"
     content = "\n".join(i.line for i in selected).encode("utf-8")
     doc = BufferedInputFile(content, filename="working_configs.txt")
     await callback.message.answer_document(
         doc,
         caption=(
             f"{_DELIVERY_LABELS.get(kind, 'Все')}: {len(selected)} конфигов.\n"
-            f"Отсортировано по {'скорости' if _SORT_KEYS.get(kind) == 'speed' else 'пингу'}."
+            f"Отсортировано по {sort_word}."
         ),
     )
     await callback.answer()
 
+
+# ── Точка входа ────────────────────────────────────────────────────────────
 
 async def main():
     os.makedirs(cfg.WORK_DIR, exist_ok=True)
@@ -347,9 +470,7 @@ async def main():
     dp.include_router(router)
     job_queue.start()
 
-    # Обновляем SNI-вайтлист с GitHub перед стартом поллинга
     await sni_whitelist.update_from_github()
-
     await dp.start_polling(bot)
 
 
