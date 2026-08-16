@@ -1,21 +1,29 @@
 """
-FIFO-очередь для задач тестирования подписок. Фиксированное число воркеров
-(JOB_CONCURRENCY) обрабатывают задачи последовательно, чтобы не плодить бесконечно
-sing-box процессы. Внутри задачи конфиги тестируются конкурентно (TEST_CONCURRENCY).
+FIFO-очередь для задач тестирования подписок.
 
-WorkingItem хранит latency_ms и speed_mbps, чтобы main.py мог выводить
-отсортированный по скорости/пингу список в кнопках выбора.
+Ключевые защиты от зависания:
+- asyncio.gather(..., return_exceptions=True) — одна упавшая корутина
+  не отменяет остальные
+- progress_cb вызывается ВНЕ lock, и обёрнута в try/except — ошибка
+  Telegram API не роняет воркер
+- _worker перезапускается при любом исключении (бесконечный цикл
+  обёрнут в try/except с логированием)
+- test_config сам по себе не кидает исключений, но на случай багов
+  worker() тоже обёрнут
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 from typing import Awaitable, Callable, List, Optional, Tuple
 
 import config as cfg
 import sni_whitelist
 from protocol_parser import ParsedConfig, build_final_link, extract_flag_emoji
 from singbox_runner import TestResult, test_config
+
+log = logging.getLogger("queue_manager")
 
 ProgressCb = Callable[[str], Awaitable[None]]
 
@@ -45,7 +53,7 @@ class Job:
 
 class JobQueue:
     def __init__(self):
-        self._queue: "asyncio.Queue[Job]" = asyncio.Queue()
+        self._queue: asyncio.Queue[Job] = asyncio.Queue()
         self._pending: List[Job] = []
         self._next_id = 1
         self._active_jobs: dict[int, Job] = {}
@@ -55,8 +63,8 @@ class JobQueue:
         if self._workers_started:
             return
         self._workers_started = True
-        for _ in range(cfg.JOB_CONCURRENCY):
-            asyncio.create_task(self._worker())
+        for i in range(cfg.JOB_CONCURRENCY):
+            asyncio.create_task(self._worker_loop(i))
 
     def position_of(self, job_id: int) -> int:
         for i, j in enumerate(self._pending):
@@ -64,8 +72,14 @@ class JobQueue:
                 return i
         return 0
 
-    async def submit(self, user_id: int, configs: List[ParsedConfig], signature: str,
-                      progress_cb: ProgressCb, done_cb: DoneCb) -> Job:
+    async def submit(
+        self,
+        user_id: int,
+        configs: List[ParsedConfig],
+        signature: str,
+        progress_cb: ProgressCb,
+        done_cb: DoneCb,
+    ) -> Job:
         job = Job(self._next_id, user_id, configs, signature, progress_cb, done_cb)
         self._next_id += 1
         self._pending.append(job)
@@ -83,18 +97,33 @@ class JobQueue:
                 return True
         return False
 
-    async def _worker(self):
+    async def _worker_loop(self, worker_id: int):
+        """Бесконечный цикл воркера. Перезапускается при любом исключении."""
+        log.info("Worker %d started", worker_id)
         while True:
-            job = await self._queue.get()
-            if job in self._pending:
-                self._pending.remove(job)
-            self._active_jobs[job.job_id] = job
             try:
-                if not job.cancelled:
-                    await self._run_job(job)
-            finally:
-                self._active_jobs.pop(job.job_id, None)
-                self._queue.task_done()
+                job = await self._queue.get()
+                if job in self._pending:
+                    self._pending.remove(job)
+                self._active_jobs[job.job_id] = job
+                try:
+                    if not job.cancelled:
+                        await self._run_job(job)
+                except Exception as e:
+                    log.exception("Worker %d: _run_job crashed (job %d): %s", worker_id, job.job_id, e)
+                finally:
+                    self._active_jobs.pop(job.job_id, None)
+                    self._queue.task_done()
+            except Exception as e:
+                log.exception("Worker %d: outer loop crashed: %s — restarting", worker_id, e)
+                await asyncio.sleep(1)
+
+    async def _safe_progress(self, job: Job, text: str):
+        """Отправляет прогресс, не роняя воркер при ошибке Telegram."""
+        try:
+            await job.progress_cb(text)
+        except Exception as e:
+            log.debug("progress_cb error (job %d): %s", job.job_id, e)
 
     async def _run_job(self, job: Job):
         total = len(job.configs)
@@ -102,37 +131,49 @@ class JobQueue:
         checked = 0
         sem = asyncio.Semaphore(cfg.TEST_CONCURRENCY)
         lock = asyncio.Lock()
+        # Буфер прогресса: накапливаем счётчик под lock, шлём Telegram вне lock
+        progress_needed = asyncio.Event()
 
-        async def worker(pc: ParsedConfig):
+        async def one_config(pc: ParsedConfig):
             nonlocal checked
             if job.cancelled:
                 return
-            async with sem:
-                if job.cancelled:
-                    return
-                result = await test_config(pc.outbound)
+            try:
+                async with sem:
+                    if job.cancelled:
+                        return
+                    result = await test_config(pc.outbound)
+            except Exception as e:
+                log.debug("test_config wrapper caught: %s", e)
+                result = TestResult(False)
+
             async with lock:
                 checked += 1
                 if result.ok:
                     working.append((pc, result))
-                if checked % 10 == 0 or checked == total:
-                    await job.progress_cb(
-                        f"Проверено {checked}/{total}, рабочих: {len(working)}"
-                    )
+                send_progress = (checked % 10 == 0 or checked == total)
 
-        await asyncio.gather(*(worker(pc) for pc in job.configs))
+            # progress_cb — вне lock, не блокирует другие воркеры
+            if send_progress:
+                await self._safe_progress(
+                    job, f"Проверено {checked}/{total}, рабочих: {len(working)}"
+                )
+
+        # return_exceptions=True: одна упавшая корутина не отменяет остальные
+        results = await asyncio.gather(
+            *(one_config(pc) for pc in job.configs),
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                log.debug("gather caught stray exception: %s", r)
 
         if job.cancelled:
             return
 
-        # Сортировка: сначала по скорости (убывает), при равенстве — по пингу (растёт)
-        def sort_key(t: Tuple[ParsedConfig, TestResult]):
-            _, r = t
-            speed = -(r.speed_mbps or 0.0)          # больше — лучше → инвертируем
-            latency = r.latency_ms if r.latency_ms is not None else float("inf")
-            return (speed, latency)
-
-        working.sort(key=sort_key)
+        # Сортировка: скорость убывает, пинг растёт
+        working.sort(key=lambda t: (-(t[1].speed_mbps or 0.0),
+                                     t[1].latency_ms if t[1].latency_ms is not None else float("inf")))
 
         items: List[WorkingItem] = []
         for idx, (pc, result) in enumerate(working, start=1):
@@ -158,4 +199,7 @@ class JobQueue:
                 speed_mbps=result.speed_mbps,
             ))
 
-        await job.done_cb(items, len(items), total)
+        try:
+            await job.done_cb(items, len(items), total)
+        except Exception as e:
+            log.exception("done_cb error (job %d): %s", job.job_id, e)
