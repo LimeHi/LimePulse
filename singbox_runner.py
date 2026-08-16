@@ -1,14 +1,14 @@
 """
-Spins up a disposable sing-box instance for a single outbound, proxies
-real HTTP requests through it, and reports whether the config actually
-works.
+Запускает одноразовый sing-box для одного outbound, проксирует
+реальные HTTP запросы через него и возвращает результат проверки.
 
-A single "does the socket open" or "did we get a 2xx" check is not enough:
-a dead/blocked server can still produce a fast local response (through a
-DPI block page, a captive portal, or a misrouted socket), which looks like
-success from the outside. To avoid counting those as working, each config
-has to pass two independent, content-verified checks against different
-endpoints before it's accepted.
+Два шага проверки, которые сложно подделать DPI/block-page:
+  1. generate_204 — должен вернуть ровно 204 с пустым телом
+  2. ipify JSON — должен вернуть реальный IP в поле "ip"
+После этого — speed-тест (опционально, не влияет на ok/fail).
+
+Все прокси-исключения (включая ProxyTimeoutError из aiohttp_socks)
+перехватываются на всех уровнях — test_config никогда не кидает наружу.
 """
 from __future__ import annotations
 
@@ -16,15 +16,28 @@ import asyncio
 import dataclasses
 import ipaddress
 import json
+import logging
 import os
 import time
 import uuid as uuidlib
 from typing import Optional, Tuple
 
 import aiohttp
-from aiohttp_socks import ProxyConnector
+from aiohttp_socks import ProxyConnector, ProxyError, ProxyTimeoutError, ProxyConnectionError
 
 import config as cfg
+
+log = logging.getLogger("singbox_runner")
+
+# Все исключения, которые могут прийти через прокси-слой
+_PROXY_ERRORS = (
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    OSError,
+    ProxyError,
+    ProxyTimeoutError,
+    ProxyConnectionError,
+)
 
 _port_lock = asyncio.Lock()
 _next_port = cfg.PORT_RANGE_START
@@ -48,7 +61,7 @@ class TestResult:
 
 
 async def test_config(outbound: dict) -> TestResult:
-    """Runs connectivity + speed checks for a single outbound."""
+    """Проверяет один outbound. Никогда не кидает исключений."""
     work_id = uuidlib.uuid4().hex[:12]
     job_dir = os.path.join(cfg.WORK_DIR, work_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -77,38 +90,46 @@ async def test_config(outbound: dict) -> TestResult:
         if not await _wait_port(port, proc, timeout=3.0):
             return TestResult(False)
 
-        connector = ProxyConnector.from_url(f"socks5://127.0.0.1:{port}")
-        timeout = aiohttp.ClientTimeout(
+        # Один коннектор — одна сессия — все три шага через него
+        connector = ProxyConnector.from_url(
+            f"socks5://127.0.0.1:{port}",
+            rdns=True,
+        )
+        # Таймаут сессии — верхняя граница для шагов 1 и 2.
+        # Для шага 3 (speed) передаём отдельный timeout явно.
+        session_timeout = aiohttp.ClientTimeout(
             total=cfg.TEST_TIMEOUT,
             connect=cfg.TEST_CONNECT_TIMEOUT,
             sock_connect=cfg.TEST_CONNECT_TIMEOUT,
             sock_read=cfg.TEST_TIMEOUT,
         )
         try:
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                # Step 1: a plain, content-checked connectivity probe. A
-                # real generate_204 endpoint always answers 204 with an
-                # empty body - block pages and captive portals almost
-                # never reproduce that exactly.
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=session_timeout,
+            ) as session:
+                # Шаг 1: generate_204
                 if not await _check_generate_204(session):
                     return TestResult(False)
 
-                # Step 2: an endpoint whose body can't be faked by a
-                # generic block page - it has to actually reach the proxy
-                # exit node and echo back a real IP as JSON. Doubles as
-                # our ping/latency measurement.
+                # Шаг 2: IP-эхо + латентность
                 start = time.monotonic()
                 ok, latency_ms = await _check_ip_echo(session, start)
                 if not ok:
                     return TestResult(False)
 
-                # Step 3: only for configs that already proved they work -
-                # measure real throughput by downloading a chunk of data.
+                # Шаг 3: замер скорости (не влияет на ok)
                 speed_mbps = await _measure_speed(session)
 
                 return TestResult(True, latency_ms, speed_mbps)
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+
+        except _PROXY_ERRORS as e:
+            log.debug("test_config outer catch: %s", e)
             return TestResult(False)
+        except Exception as e:
+            log.debug("test_config unexpected: %s", e)
+            return TestResult(False)
+
     finally:
         if proc is not None and proc.returncode is None:
             proc.kill()
@@ -131,7 +152,9 @@ async def _check_generate_204(session: aiohttp.ClientSession) -> bool:
                 return False
             body = await resp.read()
             return len(body) == 0
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+    except _PROXY_ERRORS:
+        return False
+    except Exception:
         return False
 
 
@@ -143,7 +166,9 @@ def _looks_like_ip(value: str) -> bool:
         return False
 
 
-async def _check_ip_echo(session: aiohttp.ClientSession, start: float) -> Tuple[bool, Optional[float]]:
+async def _check_ip_echo(
+    session: aiohttp.ClientSession, start: float
+) -> Tuple[bool, Optional[float]]:
     try:
         async with session.get(cfg.TEST_URL_VERIFY, allow_redirects=True) as resp:
             if resp.status != 200:
@@ -157,27 +182,28 @@ async def _check_ip_echo(session: aiohttp.ClientSession, start: float) -> Tuple[
                 return False, None
             latency_ms = (time.monotonic() - start) * 1000
             if latency_ms < cfg.MIN_PLAUSIBLE_LATENCY_MS:
-                # A real round trip to a remote exit node practically never
-                # comes back this fast - this smells like a cached or
-                # locally-terminated response, not an actual proxied one.
                 return False, None
             return True, latency_ms
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+    except _PROXY_ERRORS:
+        return False, None
+    except Exception:
         return False, None
 
 
 async def _measure_speed(session: aiohttp.ClientSession) -> Optional[float]:
-    """Downloads a chunk of data through the proxy and returns Mbit/s, or
-    None if the download failed. Capped at SPEEDTEST_MAX_DURATION so a
-    very slow proxy doesn't hold up the whole test queue."""
-    timeout = aiohttp.ClientTimeout(
+    """Скачивает кусок данных через прокси, возвращает Мбит/с или None.
+    Ограничена по времени SPEEDTEST_MAX_DURATION.
+    Любое исключение — просто None, не фейл конфига."""
+    speed_timeout = aiohttp.ClientTimeout(
         total=cfg.SPEEDTEST_MAX_DURATION + 3,
+        connect=cfg.TEST_CONNECT_TIMEOUT,
         sock_connect=cfg.TEST_CONNECT_TIMEOUT,
+        sock_read=cfg.SPEEDTEST_MAX_DURATION + 3,
     )
     try:
         start = time.monotonic()
         downloaded = 0
-        async with session.get(cfg.SPEEDTEST_URL, timeout=timeout) as resp:
+        async with session.get(cfg.SPEEDTEST_URL, timeout=speed_timeout) as resp:
             if resp.status != 200:
                 return None
             async for chunk in resp.content.iter_chunked(65536):
@@ -188,7 +214,9 @@ async def _measure_speed(session: aiohttp.ClientSession) -> Optional[float]:
         if duration <= 0 or downloaded == 0:
             return None
         return (downloaded * 8) / (duration * 1_000_000)
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+    except _PROXY_ERRORS:
+        return None
+    except Exception:
         return None
 
 
