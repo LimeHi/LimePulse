@@ -43,7 +43,7 @@ MIN_FAST_SPEED_MBPS = float(os.environ.get("MIN_FAST_SPEED_MBPS", "10"))
 MAX_FAST_PING_MS = float(os.environ.get("MAX_FAST_PING_MS", "80"))
 
 # How many configs are tested in parallel within one job
-TEST_CONCURRENCY = int(os.environ.get("TEST_CONCURRENCY", "15"))
+TEST_CONCURRENCY = int(os.environ.get("TEST_CONCURRENCY", "5"))
 
 # How many subscription jobs run at the same time across all users.
 # Keep this at 1-2 on small hosts - each job already tests many configs
