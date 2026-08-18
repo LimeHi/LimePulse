@@ -8,18 +8,17 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # /usr/local/bin/sing-box
 SINGBOX_BIN = os.environ.get("SINGBOX_BIN", "sing-box")
 
-# Step 1: connectivity probe URLs — see singbox_runner._GENERATE_204_URLS
-# (primary used for backward compat env override; runner always tries all fallbacks)
-TEST_URL_PRIMARY = os.environ.get("TEST_URL_PRIMARY", "https://cp.cloudflare.com/generate_204")
-
-# Step 2: content-verified probe. Response must be JSON with a real IP in
-# an "ip" field - this is much harder for a block page to fake than a
-# bare status code.
-# ФИКС: раньше был только один провайдер (ipify) без запасных вариантов.
-# ipify нередко отдаёт 429/пустой ответ с IP дата-центров (а именно такие
-# IP чаще всего у прокси-серверов), и рабочий конфиг ошибочно помечался
-# как нерабочий. Теперь пробуем несколько провайдеров по очереди — как
-# и на шаге connectivity-пробы.
+# Единственный шаг проверки: запрос к IP-эхо сервису через прокси.
+# Ответ должен быть JSON с реальным IP в поле "ip" — это сложно
+# подделать блок-страницей DPI, в отличие от простого статус-кода.
+#
+# ФИКС: раньше это были ДВА разных шага (отдельная "пустая" connectivity
+# проба на generate_204 + отдельно ipify) и TEST_URL_PRIMARY был URL-ом
+# generate_204-типа (без JSON), нигде фактически не использовавшимся.
+# Теперь один унифицированный список IP-эхо провайдеров, TEST_URL_PRIMARY
+# реально пробуется первым, а при неудаче — короткий перебор запасных,
+# без ipify-специфичных рейт-лимитов на один-единственный сервис.
+TEST_URL_PRIMARY = os.environ.get("TEST_URL_PRIMARY", "https://api.ipify.org?format=json")
 TEST_URL_VERIFY = os.environ.get("TEST_URL_VERIFY", "https://api.ipify.org?format=json")
 TEST_URL_VERIFY_FALLBACKS = [
     "https://api64.ipify.org?format=json",
@@ -27,9 +26,8 @@ TEST_URL_VERIFY_FALLBACKS = [
     "https://ipinfo.io/json",
 ]
 
-# Overall per-request timeout, seconds
-# Увеличено с 8 до 12: три последовательных запроса (204 + ipify + speed),
-# медленным нодам 8 сек не хватало
+# Overall per-request timeout, seconds (первая попытка verify получает
+# этот бюджет целиком, повторные — короче, см. singbox_runner._verify)
 TEST_TIMEOUT = float(os.environ.get("TEST_TIMEOUT", "12"))
 
 # TCP connect timeout, seconds
