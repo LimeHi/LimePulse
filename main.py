@@ -255,6 +255,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "Команды:\n"
         "/queue — параметры очереди\n"
         "/cancel — отменить текущий запрос"
+        "1/0 test"
     )
 
 
