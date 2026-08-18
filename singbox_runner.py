@@ -17,6 +17,7 @@ import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 import uuid as uuidlib
 from typing import Optional, Tuple
@@ -51,26 +52,19 @@ _next_port = cfg.PORT_RANGE_START
 _local_ip: Optional[str] = None
 
 
-async def _get_external_ip() -> Optional[str]:
-    """Получает внешний IP сервера напрямую без прокси."""
+def _get_local_ip() -> Optional[str]:
     global _local_ip
     if _local_ip is not None:
         return _local_ip
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.ipify.org?format=json",
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                data = await resp.json(content_type=None)
-                ip = data.get("ip") if isinstance(data, dict) else None
-                if ip and _looks_like_ip(ip):
-                    _local_ip = ip
-                    log.info("External server IP: %s", ip)
-                    return ip
-    except Exception as e:
-        log.warning("Could not fetch external IP: %s", e)
-    return None
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        _local_ip = s.getsockname()[0]
+        s.close()
+        log.info("Local server IP: %s", _local_ip)
+        return _local_ip
+    except Exception:
+        return None
 
 
 async def _claim_port() -> int:
@@ -144,8 +138,11 @@ async def test_config(outbound: dict) -> TestResult:
                 if not ok:
                     return TestResult(False)
 
-                # Шаг 3: замер скорости (не влияет на ok)
+                # Шаг 3: замер скорости — обязательное условие
+                # Если скорость < 1 Мбит/с или не измерилась — сервер не рабочий
                 speed_mbps = await _measure_speed(session)
+                if speed_mbps is None or speed_mbps < 1.0:
+                    return TestResult(False)
 
                 return TestResult(True, latency_ms, speed_mbps)
 
@@ -203,7 +200,7 @@ async def _check_ip_echo(
     Проверяет что трафик идёт через прокси, а не напрямую:
     IP полученный от ipify не должен совпадать с локальным IP сервера.
     """
-    local_ip = await _get_external_ip()
+    local_ip = _get_local_ip()
     try:
         start = time.monotonic()
         async with session.get(cfg.TEST_URL_VERIFY, allow_redirects=True) as resp:
