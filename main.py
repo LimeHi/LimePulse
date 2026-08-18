@@ -28,6 +28,8 @@ import uuid
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -460,12 +462,23 @@ async def send_selected(callback: CallbackQuery):
 
 # ── Точка входа ────────────────────────────────────────────────────────────
 
+def _build_bot() -> Bot:
+    """Создаёт Bot; если задан TELEGRAM_PROXY_HOST — ходит через свой прокси
+    вместо api.telegram.org (например, чтобы не палить прямой IP сервера)."""
+    if cfg.TELEGRAM_PROXY_HOST:
+        proxy_api = TelegramAPIServer.from_base(f"https://{cfg.TELEGRAM_PROXY_HOST}")
+        session = AiohttpSession(api=proxy_api, ssl=False)
+        log.info("Using Telegram API proxy: %s", cfg.TELEGRAM_PROXY_HOST)
+        return Bot(token=cfg.BOT_TOKEN, session=session)
+    return Bot(token=cfg.BOT_TOKEN)
+
+
 async def main():
     os.makedirs(cfg.WORK_DIR, exist_ok=True)
     if not cfg.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set")
 
-    bot = Bot(token=cfg.BOT_TOKEN)
+    bot = _build_bot()
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     job_queue.start()
