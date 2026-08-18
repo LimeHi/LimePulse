@@ -2,13 +2,12 @@
 Запускает одноразовый sing-box для одного outbound, проксирует
 реальные HTTP запросы через него и возвращает результат проверки.
 
-Два шага проверки, которые сложно подделать DPI/block-page:
-  1. connectivity probe — несколько URL (CF + Google + Microsoft), достаточно одного.
-  2. ipify JSON — должен вернуть реальный IP в поле "ip".
-После этого — speed-тест (опционально, не влияет на ok/fail).
-
-Все прокси-исключения (включая ProxyTimeoutError из aiohttp_socks)
-перехватываются на всех уровнях — test_config никогда не кидает наружу.
+Шаги проверки:
+  1. HTTPS connectivity probe (только HTTPS — HTTP может проходить напрямую
+     минуя прокси и давать ложный успех).
+  2. ipify JSON — возвращает реальный IP; проверяем что он НЕ совпадает
+     с локальным IP сервера (защита от трафика идущего напрямую).
+  3. Speed-тест (опционально, не влияет на ok/fail).
 """
 from __future__ import annotations
 
@@ -18,6 +17,7 @@ import ipaddress
 import json
 import logging
 import os
+import socket
 import time
 import uuid as uuidlib
 from typing import Optional, Tuple
@@ -38,15 +38,33 @@ _PROXY_ERRORS = (
     ProxyConnectionError,
 )
 
-# Несколько 204-эндпоинтов — пробуем по очереди, достаточно одного успеха.
-_GENERATE_204_URLS = [
+# Только HTTPS — HTTP запросы могут уходить напрямую минуя прокси
+# и давать ложный 204 даже на мёртвых серверах
+_CONNECTIVITY_URLS = [
     "https://cp.cloudflare.com/generate_204",
-    "http://connectivitycheck.gstatic.com/generate_204",
-    "http://www.msftconnecttest.com/connecttest.txt",
+    "https://connectivitycheck.gstatic.com/generate_204",
 ]
 
 _port_lock = asyncio.Lock()
 _next_port = cfg.PORT_RANGE_START
+
+# Кэш локального IP сервера — чтобы не резолвить каждый раз
+_local_ip: Optional[str] = None
+
+
+def _get_local_ip() -> Optional[str]:
+    global _local_ip
+    if _local_ip is not None:
+        return _local_ip
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        _local_ip = s.getsockname()[0]
+        s.close()
+        log.info("Local server IP: %s", _local_ip)
+        return _local_ip
+    except Exception:
+        return None
 
 
 async def _claim_port() -> int:
@@ -111,14 +129,11 @@ async def test_config(outbound: dict) -> TestResult:
                 connector=connector,
                 timeout=session_timeout,
             ) as session:
-                # Шаг 1: connectivity probe
+                # Шаг 1: HTTPS connectivity probe
                 if not await _check_connectivity(session):
                     return TestResult(False)
 
-                # Шаг 2: IP-эхо + латентность
-                # ФИКС: start берём прямо перед запросом ipify,
-                # а не до шага 1 — иначе в latency_ms включалось время
-                # connectivity-пробы и быстрые серверы не получали ⚡️
+                # Шаг 2: IP-эхо — проверяем что IP не совпадает с локальным
                 ok, latency_ms = await _check_ip_echo(session)
                 if not ok:
                     return TestResult(False)
@@ -151,25 +166,15 @@ async def test_config(outbound: dict) -> TestResult:
 
 
 async def _check_connectivity(session: aiohttp.ClientSession) -> bool:
-    """
-    Пробует несколько connectivity-URL по очереди, достаточно одного успеха.
-    Спасает серверы у которых выходной IP забанен Cloudflare.
-    """
-    for url in _GENERATE_204_URLS:
+    """Только HTTPS — исключает ложные срабатывания через прямой трафик."""
+    for url in _CONNECTIVITY_URLS:
         try:
-            async with session.get(url, allow_redirects=True) as resp:
-                if url.endswith("connecttest.txt"):
-                    if resp.status == 200:
-                        body = await resp.read()
-                        if b"Microsoft Connect Test" in body:
-                            log.debug("connectivity OK via msft")
-                            return True
-                else:
-                    if resp.status == 204:
-                        body = await resp.read()
-                        if len(body) == 0:
-                            log.debug("connectivity OK via 204: %s", url)
-                            return True
+            async with session.get(url, allow_redirects=False) as resp:
+                if resp.status == 204:
+                    body = await resp.read()
+                    if len(body) == 0:
+                        log.debug("connectivity OK: %s", url)
+                        return True
         except _PROXY_ERRORS as e:
             log.debug("connectivity probe failed (%s): %s", url, e)
         except Exception as e:
@@ -189,11 +194,10 @@ async def _check_ip_echo(
     session: aiohttp.ClientSession,
 ) -> Tuple[bool, Optional[float]]:
     """
-    ФИКС: start теперь берётся ЗДЕСЬ, а не снаружи.
-    Раньше start ставился до вызова _check_connectivity, и latency_ms
-    включала время connectivity-пробы (~1-3 сек) → быстрые серверы
-    не проходили порог MAX_FAST_PING_MS и не получали ⚡️.
+    Проверяет что трафик идёт через прокси, а не напрямую:
+    IP полученный от ipify не должен совпадать с локальным IP сервера.
     """
+    local_ip = _get_local_ip()
     try:
         start = time.monotonic()
         async with session.get(cfg.TEST_URL_VERIFY, allow_redirects=True) as resp:
@@ -206,6 +210,13 @@ async def _check_ip_echo(
             ip = data.get("ip") if isinstance(data, dict) else None
             if not ip or not _looks_like_ip(ip):
                 return False, None
+
+            # Ключевая проверка: если ipify вернул наш собственный IP —
+            # трафик идёт напрямую, прокси не работает
+            if local_ip and ip == local_ip:
+                log.debug("ip_echo: got local IP %s — proxy not working", ip)
+                return False, None
+
             latency_ms = (time.monotonic() - start) * 1000
             if latency_ms < cfg.MIN_PLAUSIBLE_LATENCY_MS:
                 return False, None
@@ -217,7 +228,6 @@ async def _check_ip_echo(
 
 
 async def _measure_speed(session: aiohttp.ClientSession) -> Optional[float]:
-    """Скачивает кусок данных через прокси, возвращает Мбит/с или None."""
     speed_timeout = aiohttp.ClientTimeout(
         total=cfg.SPEEDTEST_MAX_DURATION + 3,
         connect=cfg.TEST_CONNECT_TIMEOUT,
