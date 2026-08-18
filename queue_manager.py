@@ -51,6 +51,35 @@ class Job:
     cancelled: bool = False
 
 
+def _extract_sni(outbound: dict) -> Optional[str]:
+    """
+    Достаёт SNI из outbound для любого протокола.
+
+    Проблема была в том, что код делал только:
+        outbound.get("tls", {}).get("server_name")
+    — это работает для vless/vmess/trojan, но:
+    - hysteria2 хранит tls как вложенный dict с ключом "server_name" (ок),
+      однако sing-box иногда кладёт его под "tls" → "server_name" напрямую ✓
+    - ss вообще не имеет tls → всегда None → никогда не белый
+
+    Порядок проверки:
+    1. outbound["tls"]["server_name"]  — vless/vmess/trojan/hysteria2
+    2. outbound["server"]              — fallback: у ss это целевой хост;
+       если SNI явно не задан, проверяем хотя бы хост (иногда совпадает
+       с белым доменом, но чаще нет — это честный fallback, не магия)
+    """
+    # Путь 1: стандартный TLS-блок (vless, vmess, trojan, hysteria2)
+    tls = outbound.get("tls")
+    if isinstance(tls, dict):
+        sni = tls.get("server_name")
+        if sni:
+            return sni
+
+    # Путь 2: для ss и прочих без TLS — хост сервера
+    # Белыми они не будут (у них нет SNI), но хотя бы не падаем
+    return outbound.get("server")
+
+
 class JobQueue:
     def __init__(self):
         self._queue: asyncio.Queue[Job] = asyncio.Queue()
@@ -131,8 +160,6 @@ class JobQueue:
         checked = 0
         sem = asyncio.Semaphore(cfg.TEST_CONCURRENCY)
         lock = asyncio.Lock()
-        # Буфер прогресса: накапливаем счётчик под lock, шлём Telegram вне lock
-        progress_needed = asyncio.Event()
 
         async def one_config(pc: ParsedConfig):
             nonlocal checked
@@ -153,13 +180,11 @@ class JobQueue:
                     working.append((pc, result))
                 send_progress = (checked % 10 == 0 or checked == total)
 
-            # progress_cb — вне lock, не блокирует другие воркеры
             if send_progress:
                 await self._safe_progress(
                     job, f"Проверено {checked}/{total}, рабочих: {len(working)}"
                 )
 
-        # return_exceptions=True: одна упавшая корутина не отменяет остальные
         results = await asyncio.gather(
             *(one_config(pc) for pc in job.configs),
             return_exceptions=True,
@@ -171,7 +196,6 @@ class JobQueue:
         if job.cancelled:
             return
 
-        # Сортировка: скорость убывает, пинг растёт
         working.sort(key=lambda t: (-(t[1].speed_mbps or 0.0),
                                      t[1].latency_ms if t[1].latency_ms is not None else float("inf")))
 
@@ -181,8 +205,20 @@ class JobQueue:
                 (result.speed_mbps is not None and result.speed_mbps >= cfg.MIN_FAST_SPEED_MBPS)
                 or (result.latency_ms is not None and result.latency_ms <= cfg.MAX_FAST_PING_MS)
             )
-            sni = pc.outbound.get("tls", {}).get("server_name")
+
+            # Фикс: используем _extract_sni вместо прямого .get("tls",{}).get("server_name")
+            sni = _extract_sni(pc.outbound)
             is_white = sni_whitelist.is_whitelisted(sni)
+
+            log.debug(
+                "config #%d | speed=%.1f mbps | ping=%.0f ms | is_fast=%s | sni=%s | is_white=%s",
+                idx,
+                result.speed_mbps or 0.0,
+                result.latency_ms or 0.0,
+                is_fast,
+                sni,
+                is_white,
+            )
 
             prefix = ("⚡️" if is_fast else "") + ("⚪️" if is_white else "")
             flag = extract_flag_emoji(pc.remark)

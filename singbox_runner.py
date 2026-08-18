@@ -3,7 +3,7 @@
 реальные HTTP запросы через него и возвращает результат проверки.
 
 Два шага проверки, которые сложно подделать DPI/block-page:
-  1. generate_204 — пробуем несколько URL (CF + Google), достаточно одного.
+  1. connectivity probe — несколько URL (CF + Google + Microsoft), достаточно одного.
   2. ipify JSON — должен вернуть реальный IP в поле "ip".
 После этого — speed-тест (опционально, не влияет на ok/fail).
 
@@ -29,7 +29,6 @@ import config as cfg
 
 log = logging.getLogger("singbox_runner")
 
-# Все исключения, которые могут прийти через прокси-слой
 _PROXY_ERRORS = (
     aiohttp.ClientError,
     asyncio.TimeoutError,
@@ -40,12 +39,10 @@ _PROXY_ERRORS = (
 )
 
 # Несколько 204-эндпоинтов — пробуем по очереди, достаточно одного успеха.
-# Это спасает от ситуации когда Cloudflare сам заблокирован на узле,
-# но сервер живой.
 _GENERATE_204_URLS = [
     "https://cp.cloudflare.com/generate_204",
-    "http://connectivitycheck.gstatic.com/generate_204",   # Google (HTTP — проще проходит)
-    "http://www.msftconnecttest.com/connecttest.txt",       # Microsoft — возвращает 200 + "Microsoft Connect Test"
+    "http://connectivitycheck.gstatic.com/generate_204",
+    "http://www.msftconnecttest.com/connecttest.txt",
 ]
 
 _port_lock = asyncio.Lock()
@@ -96,7 +93,6 @@ async def test_config(outbound: dict) -> TestResult:
             stderr=asyncio.subprocess.DEVNULL,
         )
 
-        # Увеличен timeout до 5 сек — VLESS+Reality иногда стартует дольше 3
         if not await _wait_port(port, proc, timeout=5.0):
             return TestResult(False)
 
@@ -115,13 +111,15 @@ async def test_config(outbound: dict) -> TestResult:
                 connector=connector,
                 timeout=session_timeout,
             ) as session:
-                # Шаг 1: connectivity probe — любой из URL считается успехом
+                # Шаг 1: connectivity probe
                 if not await _check_connectivity(session):
                     return TestResult(False)
 
                 # Шаг 2: IP-эхо + латентность
-                start = time.monotonic()
-                ok, latency_ms = await _check_ip_echo(session, start)
+                # ФИКС: start берём прямо перед запросом ipify,
+                # а не до шага 1 — иначе в latency_ms включалось время
+                # connectivity-пробы и быстрые серверы не получали ⚡️
+                ok, latency_ms = await _check_ip_echo(session)
                 if not ok:
                     return TestResult(False)
 
@@ -154,23 +152,19 @@ async def test_config(outbound: dict) -> TestResult:
 
 async def _check_connectivity(session: aiohttp.ClientSession) -> bool:
     """
-    Пробует несколько 204/connectivity-URL по очереди.
-    Достаточно одного успеха — это спасает серверы, у которых
-    один из эндпоинтов (например Cloudflare) заблокирован на выходном IP.
-    Microsoft-вариант ожидает 200 + тело 'Microsoft Connect Test'.
+    Пробует несколько connectivity-URL по очереди, достаточно одного успеха.
+    Спасает серверы у которых выходной IP забанен Cloudflare.
     """
     for url in _GENERATE_204_URLS:
         try:
             async with session.get(url, allow_redirects=True) as resp:
                 if url.endswith("connecttest.txt"):
-                    # Microsoft: 200 + "Microsoft Connect Test"
                     if resp.status == 200:
                         body = await resp.read()
                         if b"Microsoft Connect Test" in body:
-                            log.debug("connectivity OK via msft: %s", url)
+                            log.debug("connectivity OK via msft")
                             return True
                 else:
-                    # Cloudflare / Google: ровно 204 с пустым телом
                     if resp.status == 204:
                         body = await resp.read()
                         if len(body) == 0:
@@ -180,7 +174,6 @@ async def _check_connectivity(session: aiohttp.ClientSession) -> bool:
             log.debug("connectivity probe failed (%s): %s", url, e)
         except Exception as e:
             log.debug("connectivity probe unexpected (%s): %s", url, e)
-
     return False
 
 
@@ -193,9 +186,16 @@ def _looks_like_ip(value: str) -> bool:
 
 
 async def _check_ip_echo(
-    session: aiohttp.ClientSession, start: float
+    session: aiohttp.ClientSession,
 ) -> Tuple[bool, Optional[float]]:
+    """
+    ФИКС: start теперь берётся ЗДЕСЬ, а не снаружи.
+    Раньше start ставился до вызова _check_connectivity, и latency_ms
+    включала время connectivity-пробы (~1-3 сек) → быстрые серверы
+    не проходили порог MAX_FAST_PING_MS и не получали ⚡️.
+    """
     try:
+        start = time.monotonic()
         async with session.get(cfg.TEST_URL_VERIFY, allow_redirects=True) as resp:
             if resp.status != 200:
                 return False, None
@@ -217,9 +217,7 @@ async def _check_ip_echo(
 
 
 async def _measure_speed(session: aiohttp.ClientSession) -> Optional[float]:
-    """Скачивает кусок данных через прокси, возвращает Мбит/с или None.
-    Ограничена по времени SPEEDTEST_MAX_DURATION.
-    Любое исключение — просто None, не фейл конфига."""
+    """Скачивает кусок данных через прокси, возвращает Мбит/с или None."""
     speed_timeout = aiohttp.ClientTimeout(
         total=cfg.SPEEDTEST_MAX_DURATION + 3,
         connect=cfg.TEST_CONNECT_TIMEOUT,
