@@ -2,20 +2,25 @@
 Запускает одноразовый sing-box для одного outbound, проксирует
 реальные HTTP запросы через него и возвращает результат проверки.
 
-Один шаг проверки, который сложно подделать DPI/block-page: запрос к
-одному из нескольких IP-эхо сервисов (JSON с реальным IP в поле "ip").
-Успех уже доказывает и связность, и то, что трафик реально идёт через
-удалённый выход, так и латентность.
+Проверка теперь намеренно ЖЁСТКАЯ и небыстрая — приоритет качеству, а не
+скорости прохода по подписке:
 
-ФИКС: раньше было ДВА последовательных шага — сначала «пустой» connectivity
-probe (generate_204), потом отдельно ip-эхо — по каждому перебиралось до
-4 URL с ПОЛНЫМ TEST_TIMEOUT на каждую попытку. В худшем случае это больше
-minutes на один конфиг и куча независимых точек отказа: если в моменте
-тормозит/недоступен хотя бы один из внешних сервисов (Cloudflare, Google,
-Microsoft, ipify...), рабочий конфиг всё равно уходил в "нерабочие", хотя
-сам прокси был ни при чём. Теперь шаг один, кандидатов проверяем по
-очереди, но с укороченным таймаутом на все попытки кроме первой — общий
-худший случай на порядок меньше, а число внешних точек отказа тоже.
+1. Verify: конфиг должен получить валидный IP-эхо ответ (JSON с полем
+   "ip") НЕЗАВИСИМО от cfg.REQUIRED_VERIFY_MATCHES (по умолчанию 2)
+   РАЗНЫХ провайдеров, а не от одного первого ответившего. Один
+   успешный ответ легко подделать локальным DPI/block-page для
+   конкретного домена — два разных домена одновременно подделать
+   на лету намного труднее.
+2. Leak-check: IP, который вернул прокси, сверяется с реальным прямым
+   IP этого сервера (см. _get_direct_ip). Совпадение значит, что
+   запрос по факту ушёл в обход прокси (например, transparent proxy
+   / DPI отвечает от своего имени) — такой конфиг бракуется, даже
+   если формально "ответ пришёл".
+3. Stability recheck: после успешной верификации ждём
+   cfg.STABILITY_RECHECK_DELAY секунд и делаем ЕЩЁ один запрос через
+   тот же самый прокси. Ноды, которые держат соединение долю секунды
+   и потом рвут (перегруженные / забаненные по IP), отсеиваются на
+   этом шаге.
 
 После этого — speed-тест (опционально, не влияет на ok/fail).
 
@@ -61,6 +66,40 @@ _VERIFY_URLS = list(dict.fromkeys([
 
 _port_lock = asyncio.Lock()
 _next_port = cfg.PORT_RANGE_START
+
+# Реальный прямой (без прокси) публичный IP этого сервера. Нужен, чтобы
+# отличить "прокси реально отдал внешний IP" от "запрос почему-то ушёл
+# напрямую/через transparent-proxy и отдал наш собственный IP". Кэшируется
+# один раз при первом обращении и переиспользуется всеми проверками —
+# он не меняется в рамках жизни процесса.
+_direct_ip: Optional[str] = None
+_direct_ip_lock = asyncio.Lock()
+
+
+async def _get_direct_ip() -> Optional[str]:
+    global _direct_ip
+    if _direct_ip is not None:
+        return _direct_ip
+    async with _direct_ip_lock:
+        if _direct_ip is not None:
+            return _direct_ip
+        for url in _VERIFY_URLS:
+            try:
+                timeout = aiohttp.ClientTimeout(total=8, connect=6)
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=timeout) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json(content_type=None)
+                        ip = data.get("ip") if isinstance(data, dict) else None
+                        if ip and _looks_like_ip(ip):
+                            _direct_ip = ip
+                            return _direct_ip
+            except Exception as e:
+                log.debug("direct ip probe failed via %s: %s", url, e)
+                continue
+        log.warning("could not determine direct (non-proxied) IP — leak-check disabled")
+        return None
 
 
 async def _claim_port() -> int:
@@ -120,10 +159,18 @@ async def test_config(outbound: dict) -> TestResult:
         )
         try:
             async with aiohttp.ClientSession(connector=connector) as session:
-                ok, latency_ms, reason = await _verify(session)
+                ok, latency_ms, reason = await _verify(session, required_matches=cfg.REQUIRED_VERIFY_MATCHES)
                 if not ok:
                     log.info("FAIL %s: %s", server_tag, reason)
                     return TestResult(False, reason=reason)
+
+                if cfg.STABILITY_RECHECK_DELAY > 0:
+                    await asyncio.sleep(cfg.STABILITY_RECHECK_DELAY)
+                    still_ok, _, stability_reason = await _verify(session, required_matches=1)
+                    if not still_ok:
+                        reason = f"failed stability recheck: {stability_reason}"
+                        log.info("FAIL %s: %s", server_tag, reason)
+                        return TestResult(False, reason=reason)
 
                 speed_mbps = await _measure_speed(session)
                 return TestResult(True, latency_ms, speed_mbps)
@@ -158,15 +205,28 @@ def _looks_like_ip(value: str) -> bool:
         return False
 
 
-async def _verify(session: aiohttp.ClientSession) -> Tuple[bool, Optional[float], str]:
+async def _verify(
+    session: aiohttp.ClientSession, required_matches: int = 1
+) -> Tuple[bool, Optional[float], str]:
     """
-    Пробует несколько IP-эхо провайдеров по очереди, достаточно одного успеха.
-    Первая попытка получает полный TEST_TIMEOUT, остальные — укороченный
-    таймаут, чтобы один тормозящий сервис не съедал весь бюджет проверки.
+    Пробует IP-эхо провайдеров по очереди и требует, чтобы как минимум
+    `required_matches` РАЗНЫХ провайдеров независимо подтвердили рабочий
+    прокси, прежде чем вернуть успех. Каждый успешный ответ также
+    сверяется с прямым (не через прокси) IP этого сервера — совпадение
+    означает утечку/подмену, а не реальное проксирование, и не
+    засчитывается.
+
+    Первая попытка получает полный TEST_TIMEOUT, остальные — чуть
+    укороченный, чтобы один тормозящий сервис не съедал весь бюджет.
+    Идём по списку до конца (а не останавливаемся на первом success),
+    пока не наберём нужное число подтверждений.
     """
+    direct_ip = await _get_direct_ip()
+    confirmations: list[Tuple[str, float]] = []
     last_reason = "no verify provider responded"
+
     for i, url in enumerate(_VERIFY_URLS):
-        budget = cfg.TEST_TIMEOUT if i == 0 else min(cfg.TEST_TIMEOUT, 6.0)
+        budget = cfg.TEST_TIMEOUT if i == 0 else min(cfg.TEST_TIMEOUT, 10.0)
         timeout = aiohttp.ClientTimeout(
             total=budget,
             connect=cfg.TEST_CONNECT_TIMEOUT,
@@ -192,11 +252,26 @@ async def _verify(session: aiohttp.ClientSession) -> Tuple[bool, Optional[float]
                 if latency_ms < cfg.MIN_PLAUSIBLE_LATENCY_MS:
                     last_reason = f"{url} -> suspiciously fast ({latency_ms:.1f}ms), likely faked"
                     continue
-                return True, latency_ms, ""
+                if direct_ip and ip == direct_ip:
+                    last_reason = f"{url} -> returned our own direct IP (not actually proxied)"
+                    continue
+
+                confirmations.append((url, latency_ms))
+                if len(confirmations) >= required_matches:
+                    # latency берём с первого подтверждения — оно наиболее
+                    # репрезентативно, дальнейшие подтверждения только
+                    # проверяют устойчивость, а не скорость
+                    return True, confirmations[0][1], ""
         except _PROXY_ERRORS as e:
             last_reason = f"{url} -> {e}"
         except Exception as e:
             last_reason = f"{url} -> unexpected: {e}"
+
+    if confirmations:
+        last_reason = (
+            f"only {len(confirmations)}/{required_matches} providers confirmed "
+            f"real proxied connectivity"
+        )
     return False, None, last_reason
 
 

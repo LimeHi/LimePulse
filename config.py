@@ -28,16 +28,31 @@ TEST_URL_VERIFY_FALLBACKS = [
 
 # Overall per-request timeout, seconds (первая попытка verify получает
 # этот бюджет целиком, повторные — короче, см. singbox_runner._verify)
-TEST_TIMEOUT = float(os.environ.get("TEST_TIMEOUT", "12"))
+# Приоритет теперь качество проверки, а не скорость — бюджет увеличен.
+TEST_TIMEOUT = float(os.environ.get("TEST_TIMEOUT", "20"))
 
 # TCP connect timeout, seconds
-TEST_CONNECT_TIMEOUT = float(os.environ.get("TEST_CONNECT_TIMEOUT", "6"))
+TEST_CONNECT_TIMEOUT = float(os.environ.get("TEST_CONNECT_TIMEOUT", "10"))
 
 # A real round trip through a remote exit node essentially never comes
 # back faster than this; anything under it is treated as a fake/local
 # response rather than a working proxy.
 # Снижено с 15 до 5 мс — 15 мс иногда отсекало близкие ноды
 MIN_PLAUSIBLE_LATENCY_MS = float(os.environ.get("MIN_PLAUSIBLE_LATENCY_MS", "5"))
+
+# Сколько РАЗНЫХ IP-эхо провайдеров должны независимо подтвердить, что
+# конфиг реально проксирует трафик, прежде чем он считается рабочим.
+# Раньше хватало одного успешного ответа — этого достаточно, чтобы
+# отсечь мёртвые серверы, но не достаточно, чтобы отсечь DPI/block-page,
+# которая иногда отдаёт правдоподобный JSON на один конкретный домен.
+REQUIRED_VERIFY_MATCHES = int(os.environ.get("REQUIRED_VERIFY_MATCHES", "2"))
+
+# Пауза перед повторной проверкой на стабильность, сек. После того как
+# конфиг прошёл первичную верификацию, ждём этот интервал и делаем ещё
+# один запрос через тот же прокси — отсеивает ноды, которые "живут"
+# долю секунды и затем рвут соединение (типично для перегруженных или
+# банящихся по IP серверов). 0 — отключить.
+STABILITY_RECHECK_DELAY = float(os.environ.get("STABILITY_RECHECK_DELAY", "3"))
 
 # Speed test
 SPEEDTEST_URL = os.environ.get("SPEEDTEST_URL", "https://speed.cloudflare.com/__down?bytes=4000000")
