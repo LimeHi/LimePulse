@@ -32,13 +32,26 @@ ss / hysteria2), реально проверяет каждый через яд�
 |--------------------|--------------------------------------------|-------|
 | `BOT_TOKEN`        | —                                          | токен бота, обязателен |
 | `SINGBOX_BIN`       | `sing-box`                                 | путь к бинарю sing-box |
-| `TEST_URL`         | `https://www.gstatic.com/generate_204`     | URL для проверки соединения |
-| `TEST_TIMEOUT`      | `8`                                         | таймаут одного теста, сек |
-| `TEST_CONCURRENCY`  | `15`                                        | параллельных тестов внутри одной подписки |
+| `TEST_URL_PRIMARY` | `https://cp.cloudflare.com/generate_204`   | основной URL шага 1 (connectivity), пробуется первым |
+| `TEST_URL_VERIFY`  | `https://api.ipify.org?format=json`        | основной URL шага 2 (IP-эхо), пробуется первым |
+| `TEST_TIMEOUT`      | `12`                                        | общий таймаут одного запроса, сек |
+| `TEST_CONNECT_TIMEOUT` | `6`                                     | таймаут TCP-коннекта, сек |
+| `MIN_PLAUSIBLE_LATENCY_MS` | `5`                                 | отсечка "слишком быстрого" (подставного) ответа |
+| `SPEEDTEST_URL`    | `https://speed.cloudflare.com/__down?bytes=4000000` | URL для замера скорости |
+| `SPEEDTEST_MAX_DURATION` | `6`                                   | макс. длительность замера скорости, сек |
+| `MIN_FAST_SPEED_MBPS` | `10`                                     | порог скорости для метки ⚡️ |
+| `MAX_FAST_PING_MS` | `80`                                        | порог пинга для метки ⚡️ |
+| `TEST_CONCURRENCY`  | `5`                                         | параллельных тестов внутри одной подписки |
 | `JOB_CONCURRENCY`   | `1`                                         | параллельных подписок |
 | `MAX_CONFIGS`       | `400`                                       | лимит конфигов на подписку |
 | `PORT_RANGE_START` / `PORT_RANGE_END` | `20000` / `29999`      | диапазон локальных портов для временных sing-box инстансов |
 | `WORK_DIR`          | `/tmp/singbox_jobs`                         | папка для временных конфигов sing-box |
+| `TELEGRAM_PROXY_HOST` | —                                         | свой прокси перед api.telegram.org (опционально) |
+
+Оба шага проверки (`TEST_URL_PRIMARY` / `TEST_URL_VERIFY`) на самом деле
+пробуют по очереди ещё несколько запасных URL — так один упавший или
+зарейтлимиченный сервис (например, ipify) не топит проверку рабочих
+конфигов.
 
 ## Запуск локально
 
@@ -63,6 +76,12 @@ Dockerfile.
 
 `vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://` (`hy2://`).
 Для vless/trojan поддерживаются транспорты `tcp` / `ws` / `grpc` / `http`
-и TLS/Reality. Добавить протокол (например `tuic`) — дописать парсер в
+и TLS/Reality, включая `allowInsecure=1` / `insecure=1` (самоподписанные
+сертификаты). Добавить протокол (например `tuic`) — дописать парсер в
 `protocol_parser.py` по образцу существующих и зарегистрировать его в
 `_SCHEME_PARSERS`.
+
+Ограничение: `ss://` со SIP003-плагином (`?plugin=obfs-local...`,
+`v2ray-plugin` и т.п.) не поддерживается — в образе нет бинарников
+плагинов, такие ссылки отбрасываются на этапе разбора, а не тихо
+проверяются "как есть" без обфускации.

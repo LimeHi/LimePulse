@@ -15,7 +15,17 @@ TEST_URL_PRIMARY = os.environ.get("TEST_URL_PRIMARY", "https://cp.cloudflare.com
 # Step 2: content-verified probe. Response must be JSON with a real IP in
 # an "ip" field - this is much harder for a block page to fake than a
 # bare status code.
+# ФИКС: раньше был только один провайдер (ipify) без запасных вариантов.
+# ipify нередко отдаёт 429/пустой ответ с IP дата-центров (а именно такие
+# IP чаще всего у прокси-серверов), и рабочий конфиг ошибочно помечался
+# как нерабочий. Теперь пробуем несколько провайдеров по очереди — как
+# и на шаге connectivity-пробы.
 TEST_URL_VERIFY = os.environ.get("TEST_URL_VERIFY", "https://api.ipify.org?format=json")
+TEST_URL_VERIFY_FALLBACKS = [
+    "https://api64.ipify.org?format=json",
+    "https://ifconfig.co/json",
+    "https://ipinfo.io/json",
+]
 
 # Overall per-request timeout, seconds
 # Увеличено с 8 до 12: три последовательных запроса (204 + ipify + speed),

@@ -135,6 +135,9 @@ def _parse_vmess(uri: str) -> ParsedConfig:
         "serviceName": data.get("path", ""),
         "sni": data.get("sni", "") or data.get("host", ""),
         "fp": data.get("fp", ""),
+        # некоторые генераторы кладут флаг пропуска проверки сертификата
+        # прямо в vmess JSON под этим именем
+        "allowInsecure": str(data.get("allowInsecure", "")),
     }
     _attach_transport(outbound, net, q)
     _attach_tls(outbound, "tls" if tls == "tls" else "none", q, host)
@@ -168,6 +171,18 @@ def _parse_trojan(uri: str) -> ParsedConfig:
 def _parse_ss(uri: str) -> ParsedConfig:
     p = urlparse(uri)
     remark = _get_remark(p.fragment)
+
+    # ФИКС: ссылки с SIP003-плагином (obfs-local / v2ray-plugin, параметр
+    # ?plugin=...) раньше проходили парсинг молча, plugin просто
+    # отбрасывался, и sing-box пытался подключиться напрямую без
+    # обфускации. Сервер такое соединение почти всегда отклоняет, и
+    # рабочий конфиг попадал в "нерабочие" без внятной причины. В образе
+    # нет бинарников плагинов, поэтому честно помечаем такие ссылки как
+    # неподдерживаемые вместо того, чтобы тратить слот на заведомо
+    # обречённую проверку и путать статистику.
+    q = {k: v[0] for k, v in parse_qs(p.query).items()}
+    if q.get("plugin"):
+        raise ParseError("ss with SIP003 plugin is not supported")
 
     if p.username and p.hostname and p.port:
         userinfo = p.username
@@ -242,12 +257,23 @@ def _attach_transport(outbound: dict, net: str, q: dict) -> None:
     # tcp / raw: no transport block needed
 
 
+def _is_truthy(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes")
+
+
 def _attach_tls(outbound: dict, security: str, q: dict, default_sni: str) -> None:
     if security in ("tls", "reality"):
+        # ФИКС: раньше insecure всегда было False, из-за чего конфиги с
+        # самоподписанным сертификатом (allowInsecure=1 / insecure=1 в
+        # ссылке — обычное дело для личных vless/trojan серверов) не
+        # проходили TLS-хендшейк в sing-box и ошибочно считались нерабочими,
+        # хотя в любом реальном клиенте (v2rayN, nekoray и т.д.) этот же
+        # флаг из ссылки заставил бы клиент пропустить проверку сертификата.
+        insecure = _is_truthy(q.get("allowInsecure")) or _is_truthy(q.get("insecure"))
         tls = {
             "enabled": True,
             "server_name": q.get("sni") or default_sni,
-            "insecure": False,
+            "insecure": insecure,
         }
         fp = q.get("fp")
         if fp:

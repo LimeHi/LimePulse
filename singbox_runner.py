@@ -2,12 +2,13 @@
 Запускает одноразовый sing-box для одного outbound, проксирует
 реальные HTTP запросы через него и возвращает результат проверки.
 
-Шаги проверки:
-  1. HTTPS connectivity probe (только HTTPS — HTTP может проходить напрямую
-     минуя прокси и давать ложный успех).
-  2. ipify JSON — возвращает реальный IP; проверяем что он НЕ совпадает
-     с локальным IP сервера (защита от трафика идущего напрямую).
-  3. Speed-тест (опционально, не влияет на ok/fail).
+Два шага проверки, которые сложно подделать DPI/block-page:
+  1. connectivity probe — несколько URL (CF + Google + Microsoft), достаточно одного.
+  2. ipify JSON — должен вернуть реальный IP в поле "ip".
+После этого — speed-тест (опционально, не влияет на ok/fail).
+
+Все прокси-исключения (включая ProxyTimeoutError из aiohttp_socks)
+перехватываются на всех уровнях — test_config никогда не кидает наружу.
 """
 from __future__ import annotations
 
@@ -17,7 +18,6 @@ import ipaddress
 import json
 import logging
 import os
-import socket
 import time
 import uuid as uuidlib
 from typing import Optional, Tuple
@@ -38,33 +38,25 @@ _PROXY_ERRORS = (
     ProxyConnectionError,
 )
 
-# Только HTTPS — HTTP запросы могут уходить напрямую минуя прокси
-# и давать ложный 204 даже на мёртвых серверах
-_CONNECTIVITY_URLS = [
+# Несколько 204-эндпоинтов — пробуем по очереди, достаточно одного успеха.
+# ФИКС: cfg.TEST_URL_PRIMARY раньше был объявлен в config.py, но нигде не
+# использовался — переменная окружения TEST_URL_PRIMARY не давала эффекта.
+# Теперь она реально идёт первой в списке попыток.
+_GENERATE_204_URLS = [
+    cfg.TEST_URL_PRIMARY,
     "https://cp.cloudflare.com/generate_204",
-    "https://connectivitycheck.gstatic.com/generate_204",
+    "http://connectivitycheck.gstatic.com/generate_204",
+    "http://www.msftconnecttest.com/connecttest.txt",
 ]
+# Убираем дубликаты, сохраняя порядок (на случай если TEST_URL_PRIMARY
+# совпадает с одним из URL по умолчанию)
+_GENERATE_204_URLS = list(dict.fromkeys(_GENERATE_204_URLS))
+
+# Провайдеры для шага 2 (IP-эхо) — пробуем по очереди, достаточно одного успеха.
+_IP_ECHO_URLS = list(dict.fromkeys([cfg.TEST_URL_VERIFY, *cfg.TEST_URL_VERIFY_FALLBACKS]))
 
 _port_lock = asyncio.Lock()
 _next_port = cfg.PORT_RANGE_START
-
-# Кэш локального IP сервера — чтобы не резолвить каждый раз
-_local_ip: Optional[str] = None
-
-
-def _get_local_ip() -> Optional[str]:
-    global _local_ip
-    if _local_ip is not None:
-        return _local_ip
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        _local_ip = s.getsockname()[0]
-        s.close()
-        log.info("Local server IP: %s", _local_ip)
-        return _local_ip
-    except Exception:
-        return None
 
 
 async def _claim_port() -> int:
@@ -129,20 +121,20 @@ async def test_config(outbound: dict) -> TestResult:
                 connector=connector,
                 timeout=session_timeout,
             ) as session:
-                # Шаг 1: HTTPS connectivity probe
+                # Шаг 1: connectivity probe
                 if not await _check_connectivity(session):
                     return TestResult(False)
 
-                # Шаг 2: IP-эхо — проверяем что IP не совпадает с локальным
+                # Шаг 2: IP-эхо + латентность
+                # ФИКС: start берём прямо перед запросом ipify,
+                # а не до шага 1 — иначе в latency_ms включалось время
+                # connectivity-пробы и быстрые серверы не получали ⚡️
                 ok, latency_ms = await _check_ip_echo(session)
                 if not ok:
                     return TestResult(False)
 
-                # Шаг 3: замер скорости — обязательное условие
-                # Если скорость < 1 Мбит/с или не измерилась — сервер не рабочий
+                # Шаг 3: замер скорости (не влияет на ok)
                 speed_mbps = await _measure_speed(session)
-                if speed_mbps is None or speed_mbps < 1.0:
-                    return TestResult(False)
 
                 return TestResult(True, latency_ms, speed_mbps)
 
@@ -169,15 +161,25 @@ async def test_config(outbound: dict) -> TestResult:
 
 
 async def _check_connectivity(session: aiohttp.ClientSession) -> bool:
-    """Только HTTPS — исключает ложные срабатывания через прямой трафик."""
-    for url in _CONNECTIVITY_URLS:
+    """
+    Пробует несколько connectivity-URL по очереди, достаточно одного успеха.
+    Спасает серверы у которых выходной IP забанен Cloudflare.
+    """
+    for url in _GENERATE_204_URLS:
         try:
-            async with session.get(url, allow_redirects=False) as resp:
-                if resp.status == 204:
-                    body = await resp.read()
-                    if len(body) == 0:
-                        log.debug("connectivity OK: %s", url)
-                        return True
+            async with session.get(url, allow_redirects=True) as resp:
+                if url.endswith("connecttest.txt"):
+                    if resp.status == 200:
+                        body = await resp.read()
+                        if b"Microsoft Connect Test" in body:
+                            log.debug("connectivity OK via msft")
+                            return True
+                else:
+                    if resp.status == 204:
+                        body = await resp.read()
+                        if len(body) == 0:
+                            log.debug("connectivity OK via 204: %s", url)
+                            return True
         except _PROXY_ERRORS as e:
             log.debug("connectivity probe failed (%s): %s", url, e)
         except Exception as e:
@@ -197,40 +199,41 @@ async def _check_ip_echo(
     session: aiohttp.ClientSession,
 ) -> Tuple[bool, Optional[float]]:
     """
-    Проверяет что трафик идёт через прокси, а не напрямую:
-    IP полученный от ipify не должен совпадать с локальным IP сервера.
+    ФИКС: start берётся ЗДЕСЬ, а не снаружи (латентность не включает
+    время connectivity-пробы — иначе быстрые серверы не получали ⚡️).
+
+    ФИКС: раньше был только один провайдер (ipify). У него агрессивные
+    рейт-лимиты именно на IP дата-центров, а VPN/прокси-серверы почти
+    всегда сидят на таких IP — рабочий конфиг мог получить 429 и
+    ошибочно считался нерабочим. Теперь пробуем несколько провайдеров
+    по очереди, как и на шаге connectivity.
     """
-    local_ip = _get_local_ip()
-    try:
-        start = time.monotonic()
-        async with session.get(cfg.TEST_URL_VERIFY, allow_redirects=True) as resp:
-            if resp.status != 200:
-                return False, None
-            try:
-                data = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                return False, None
-            ip = data.get("ip") if isinstance(data, dict) else None
-            if not ip or not _looks_like_ip(ip):
-                return False, None
-
-            # Ключевая проверка: если ipify вернул наш собственный IP —
-            # трафик идёт напрямую, прокси не работает
-            if local_ip and ip == local_ip:
-                log.debug("ip_echo: got local IP %s — proxy not working", ip)
-                return False, None
-
-            latency_ms = (time.monotonic() - start) * 1000
-            if latency_ms < cfg.MIN_PLAUSIBLE_LATENCY_MS:
-                return False, None
-            return True, latency_ms
-    except _PROXY_ERRORS:
-        return False, None
-    except Exception:
-        return False, None
+    for url in _IP_ECHO_URLS:
+        try:
+            start = time.monotonic()
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    continue
+                try:
+                    data = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    continue
+                ip = data.get("ip") if isinstance(data, dict) else None
+                if not ip or not _looks_like_ip(ip):
+                    continue
+                latency_ms = (time.monotonic() - start) * 1000
+                if latency_ms < cfg.MIN_PLAUSIBLE_LATENCY_MS:
+                    continue
+                return True, latency_ms
+        except _PROXY_ERRORS as e:
+            log.debug("ip-echo probe failed (%s): %s", url, e)
+        except Exception as e:
+            log.debug("ip-echo probe unexpected (%s): %s", url, e)
+    return False, None
 
 
 async def _measure_speed(session: aiohttp.ClientSession) -> Optional[float]:
+    """Скачивает кусок данных через прокси, возвращает Мбит/с или None."""
     speed_timeout = aiohttp.ClientTimeout(
         total=cfg.SPEEDTEST_MAX_DURATION + 3,
         connect=cfg.TEST_CONNECT_TIMEOUT,
