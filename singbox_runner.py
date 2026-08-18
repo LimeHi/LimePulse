@@ -3,8 +3,8 @@
 реальные HTTP запросы через него и возвращает результат проверки.
 
 Два шага проверки, которые сложно подделать DPI/block-page:
-  1. generate_204 — должен вернуть ровно 204 с пустым телом
-  2. ipify JSON — должен вернуть реальный IP в поле "ip"
+  1. generate_204 — пробуем несколько URL (CF + Google), достаточно одного.
+  2. ipify JSON — должен вернуть реальный IP в поле "ip".
 После этого — speed-тест (опционально, не влияет на ok/fail).
 
 Все прокси-исключения (включая ProxyTimeoutError из aiohttp_socks)
@@ -38,6 +38,15 @@ _PROXY_ERRORS = (
     ProxyTimeoutError,
     ProxyConnectionError,
 )
+
+# Несколько 204-эндпоинтов — пробуем по очереди, достаточно одного успеха.
+# Это спасает от ситуации когда Cloudflare сам заблокирован на узле,
+# но сервер живой.
+_GENERATE_204_URLS = [
+    "https://cp.cloudflare.com/generate_204",
+    "http://connectivitycheck.gstatic.com/generate_204",   # Google (HTTP — проще проходит)
+    "http://www.msftconnecttest.com/connecttest.txt",       # Microsoft — возвращает 200 + "Microsoft Connect Test"
+]
 
 _port_lock = asyncio.Lock()
 _next_port = cfg.PORT_RANGE_START
@@ -87,16 +96,14 @@ async def test_config(outbound: dict) -> TestResult:
             stderr=asyncio.subprocess.DEVNULL,
         )
 
-        if not await _wait_port(port, proc, timeout=3.0):
+        # Увеличен timeout до 5 сек — VLESS+Reality иногда стартует дольше 3
+        if not await _wait_port(port, proc, timeout=5.0):
             return TestResult(False)
 
-        # Один коннектор — одна сессия — все три шага через него
         connector = ProxyConnector.from_url(
             f"socks5://127.0.0.1:{port}",
             rdns=True,
         )
-        # Таймаут сессии — верхняя граница для шагов 1 и 2.
-        # Для шага 3 (speed) передаём отдельный timeout явно.
         session_timeout = aiohttp.ClientTimeout(
             total=cfg.TEST_TIMEOUT,
             connect=cfg.TEST_CONNECT_TIMEOUT,
@@ -108,8 +115,8 @@ async def test_config(outbound: dict) -> TestResult:
                 connector=connector,
                 timeout=session_timeout,
             ) as session:
-                # Шаг 1: generate_204
-                if not await _check_generate_204(session):
+                # Шаг 1: connectivity probe — любой из URL считается успехом
+                if not await _check_connectivity(session):
                     return TestResult(False)
 
                 # Шаг 2: IP-эхо + латентность
@@ -145,17 +152,36 @@ async def test_config(outbound: dict) -> TestResult:
             pass
 
 
-async def _check_generate_204(session: aiohttp.ClientSession) -> bool:
-    try:
-        async with session.get(cfg.TEST_URL_PRIMARY, allow_redirects=True) as resp:
-            if resp.status != 204:
-                return False
-            body = await resp.read()
-            return len(body) == 0
-    except _PROXY_ERRORS:
-        return False
-    except Exception:
-        return False
+async def _check_connectivity(session: aiohttp.ClientSession) -> bool:
+    """
+    Пробует несколько 204/connectivity-URL по очереди.
+    Достаточно одного успеха — это спасает серверы, у которых
+    один из эндпоинтов (например Cloudflare) заблокирован на выходном IP.
+    Microsoft-вариант ожидает 200 + тело 'Microsoft Connect Test'.
+    """
+    for url in _GENERATE_204_URLS:
+        try:
+            async with session.get(url, allow_redirects=True) as resp:
+                if url.endswith("connecttest.txt"):
+                    # Microsoft: 200 + "Microsoft Connect Test"
+                    if resp.status == 200:
+                        body = await resp.read()
+                        if b"Microsoft Connect Test" in body:
+                            log.debug("connectivity OK via msft: %s", url)
+                            return True
+                else:
+                    # Cloudflare / Google: ровно 204 с пустым телом
+                    if resp.status == 204:
+                        body = await resp.read()
+                        if len(body) == 0:
+                            log.debug("connectivity OK via 204: %s", url)
+                            return True
+        except _PROXY_ERRORS as e:
+            log.debug("connectivity probe failed (%s): %s", url, e)
+        except Exception as e:
+            log.debug("connectivity probe unexpected (%s): %s", url, e)
+
+    return False
 
 
 def _looks_like_ip(value: str) -> bool:
