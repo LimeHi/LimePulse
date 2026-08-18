@@ -62,4 +62,4 @@ PORT_RANGE_END = int(os.environ.get("PORT_RANGE_END", "29999"))
 # Where temporary sing-box config files / working dirs are written
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/singbox_jobs")
 
-PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "")
+TELEGRAM_PROXY_HOST = os.getenv("TELEGRAM_PROXY_HOST", "")
