@@ -467,7 +467,8 @@ def _build_bot() -> Bot:
     вместо api.telegram.org (например, чтобы не палить прямой IP сервера)."""
     if cfg.TELEGRAM_PROXY_HOST:
         proxy_api = TelegramAPIServer.from_base(f"https://{cfg.TELEGRAM_PROXY_HOST}")
-        session = AiohttpSession(api=proxy_api, ssl=False)
+        session = AiohttpSession(api=proxy_api)
+        session._connector_init["ssl"] = False
         log.info("Using Telegram API proxy: %s", cfg.TELEGRAM_PROXY_HOST)
         return Bot(token=cfg.BOT_TOKEN, session=session)
     return Bot(token=cfg.BOT_TOKEN)
