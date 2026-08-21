@@ -71,6 +71,16 @@ SPEEDTEST_MAX_DURATION = float(os.environ.get("SPEEDTEST_MAX_DURATION", "6"))
 MIN_FAST_SPEED_MBPS = float(os.environ.get("MIN_FAST_SPEED_MBPS", "10"))
 MAX_FAST_PING_MS = float(os.environ.get("MAX_FAST_PING_MS", "80"))
 
+# Порог "коллапса под нагрузкой": если throughput на speed-тесте ниже этого
+# значения (или тест вообще не смог скачать данные), это ЕЩЁ не бракует
+# конфиг само по себе — сервер может быть просто медленным. Но если ПОСЛЕ
+# такого speed-теста конфиг не проходит повторный verify — это явный
+# признак того, что соединение не выдержало устойчивой нагрузки (типичный
+# DPI-паттерн "работает первые секунды, потом душится"), и тогда конфиг
+# бракуется. Специально низкий порог (50 Кбит/с) — цель не отсеять
+# медленные ноды, а поймать полный коллапс throughput под нагрузкой.
+MIN_SUSTAINED_SPEED_MBPS = float(os.environ.get("MIN_SUSTAINED_SPEED_MBPS", "0.05"))
+
 # How many configs are tested in parallel within one job
 TEST_CONCURRENCY = int(os.environ.get("TEST_CONCURRENCY", "5"))
 

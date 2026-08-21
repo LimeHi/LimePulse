@@ -50,6 +50,7 @@ import ipaddress
 import json
 import logging
 import os
+import random
 import time
 import uuid as uuidlib
 from typing import Optional, Tuple
@@ -281,6 +282,32 @@ async def test_config(outbound: dict) -> TestResult:
                         return TestResult(False, reason=reason)
 
                 speed_mbps = await _measure_speed(session)
+
+                # Пост-нагрузочная проверка: некоторые DPI (задокументировано,
+                # например, в GoodbyeDPI issue #304 — "works ok for a few
+                # minutes then the shittification gets switched on") не режут
+                # соединение сразу, а начинают душить его ПОСЛЕ того, как
+                # через него прошёл заметный объём устойчивого TLS-трафика —
+                # то есть ровно во время speed-теста. Обычный verify до
+                # спид-теста этот паттерн не ловит: конфиг успевает пройти
+                # его, пока DPI ещё "не решил". Поэтому если throughput
+                # оказался практически нулевым (соединение не выдержало
+                # реальной нагрузки), делаем ещё один verify ПОСЛЕ спид-
+                # теста — если он тоже проваливается, это не "сервер
+                # медленный", а "сервер сдох под нагрузкой", и конфиг
+                # бракуется, а не просто остаётся без ⚡️.
+                if speed_mbps is None or speed_mbps < cfg.MIN_SUSTAINED_SPEED_MBPS:
+                    still_ok_after_load, _, after_load_reason, _ = await _verify(
+                        session, required_matches=1
+                    )
+                    if not still_ok_after_load:
+                        reason = (
+                            f"connection collapsed under sustained load "
+                            f"(DPI-подобная деградация после нагрузки): {after_load_reason}"
+                        )
+                        log.info("FAIL %s: %s", server_tag, reason)
+                        return TestResult(False, reason=reason, dpi_blocked=True)
+
                 return TestResult(True, latency_ms, speed_mbps)
 
         except _PROXY_ERRORS as e:
@@ -341,7 +368,16 @@ async def _verify(
     last_reason = "no verify provider responded"
     got_any_response = False
 
-    for i, url in enumerate(_VERIFY_URLS):
+    # Порядок провайдеров перемешивается на каждый вызов: если всегда
+    # стучаться в одном и том же порядке с одинаковыми интервалами, это
+    # само по себе узнаваемый паттерн, по которому DPI мог бы в теории
+    # отличить трафик чекера от обычного пользователя. Первый элемент по
+    # прежнему получает полный TEST_TIMEOUT — это просто позиция в списке,
+    # а не конкретный домен.
+    shuffled_urls = list(_VERIFY_URLS)
+    random.shuffle(shuffled_urls)
+
+    for i, url in enumerate(shuffled_urls):
         budget = cfg.TEST_TIMEOUT if i == 0 else min(cfg.TEST_TIMEOUT, 10.0)
         timeout = aiohttp.ClientTimeout(
             total=budget,
