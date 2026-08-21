@@ -356,9 +356,15 @@ async def _enqueue(message: Message, state: FSMContext, signature: str):
         except Exception:
             pass
 
-    async def done_cb(items: list[WorkingItem], working: int, total: int):
+    async def done_cb(items: list[WorkingItem], working: int, total: int, dpi_blocked: int):
+        dpi_note = (
+            f"🚫 Похоже заблокировано DPI (соединение есть, трафика нет): {dpi_blocked}\n"
+            if dpi_blocked else ""
+        )
         if not items:
-            await progress_cb(f"Готово. Рабочих конфигов: 0 из {total}.")
+            await progress_cb(
+                f"Готово. Рабочих конфигов: 0 из {total}.\n{dpi_note}"
+            )
             return
 
         result_id = uuid.uuid4().hex[:10]
@@ -369,7 +375,8 @@ async def _enqueue(message: Message, state: FSMContext, signature: str):
 
         summary = (
             f"Готово: {working} рабочих из {total}.\n"
-            f"⚪️ Белые SNI: {white_count}  🖤 Обычные: {black_count}\n\n"
+            f"⚪️ Белые SNI: {white_count}  🖤 Обычные: {black_count}\n"
+            f"{dpi_note}\n"
             "Что прислать файлом?"
         )
         kb = _main_keyboard(result_id, items)

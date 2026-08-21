@@ -1,4 +1,9 @@
 aiogram>=3.4,<4
 aiohttp>=3.9
 aiohttp-socks>=0.8
+# python_socks уже тянется транзитивно через aiohttp-socks, но
+# singbox_runner._tcp_reachable_via_proxy обращается к его async API
+# напрямую (голый SOCKS5 TCP-коннект для DPI-диагностики) — фиксируем
+# явно, чтобы версия не расползалась при апдейте aiohttp-socks.
+python-socks[asyncio]>=2.4
 python-dotenv>=1.0

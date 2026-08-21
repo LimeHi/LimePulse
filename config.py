@@ -34,6 +34,13 @@ TEST_TIMEOUT = float(os.environ.get("TEST_TIMEOUT", "20"))
 # TCP connect timeout, seconds
 TEST_CONNECT_TIMEOUT = float(os.environ.get("TEST_CONNECT_TIMEOUT", "10"))
 
+# Таймаут отдельной DPI-диагностики (см. singbox_runner._classify_dpi_block):
+# сколько ждём "голый" SOCKS5 TCP-туннель до verify-хоста через тот же
+# outbound, когда обычный HTTP-verify провалился без единого ответа.
+# Специально короче TEST_CONNECT_TIMEOUT — это лишь уточняющая проба,
+# не хочется тратить на неё столько же времени, сколько на основную попытку.
+DPI_PROBE_TIMEOUT = float(os.environ.get("DPI_PROBE_TIMEOUT", "6"))
+
 # A real round trip through a remote exit node essentially never comes
 # back faster than this; anything under it is treated as a fake/local
 # response rather than a working proxy.

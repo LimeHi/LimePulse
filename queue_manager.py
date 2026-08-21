@@ -37,7 +37,7 @@ class WorkingItem:
     speed_mbps: Optional[float] = None
 
 
-DoneCb = Callable[[List[WorkingItem], int, int], Awaitable[None]]
+DoneCb = Callable[[List[WorkingItem], int, int, int], Awaitable[None]]
 
 
 @dataclasses.dataclass
@@ -158,11 +158,12 @@ class JobQueue:
         total = len(job.configs)
         working: List[Tuple[ParsedConfig, TestResult]] = []
         checked = 0
+        dpi_blocked = 0
         sem = asyncio.Semaphore(cfg.TEST_CONCURRENCY)
         lock = asyncio.Lock()
 
         async def one_config(pc: ParsedConfig):
-            nonlocal checked
+            nonlocal checked, dpi_blocked
             if job.cancelled:
                 return
             try:
@@ -178,6 +179,8 @@ class JobQueue:
                 checked += 1
                 if result.ok:
                     working.append((pc, result))
+                elif result.dpi_blocked:
+                    dpi_blocked += 1
                 send_progress = (checked % 10 == 0 or checked == total)
 
             if send_progress:
@@ -208,7 +211,10 @@ class JobQueue:
 
             # Фикс: используем _extract_sni вместо прямого .get("tls",{}).get("server_name")
             sni = _extract_sni(pc.outbound)
-            is_white = sni_whitelist.is_whitelisted(sni)
+            # Белый по домену (SNI) ИЛИ по IP сервера (диапазоны, которые
+            # массово держат легитимный рунет-трафик, см. sni_whitelist._WHITELIST_CIDRS)
+            server_ip = pc.outbound.get("server")
+            is_white = sni_whitelist.is_whitelisted(sni) or sni_whitelist.is_ip_whitelisted(server_ip)
 
             log.debug(
                 "config #%d | speed=%.1f mbps | ping=%.0f ms | is_fast=%s | sni=%s | is_white=%s",
@@ -236,6 +242,6 @@ class JobQueue:
             ))
 
         try:
-            await job.done_cb(items, len(items), total)
+            await job.done_cb(items, len(items), total, dpi_blocked)
         except Exception as e:
             log.exception("done_cb error (job %d): %s", job.job_id, e)
